@@ -1,29 +1,47 @@
 import React, { useState, KeyboardEvent, useRef, useEffect } from "react";
 import {
-  Pencil,
-  ChevronDown,
-  ChevronRight,
-  ChevronLeft,
-  Check,
   Sparkles,
   ArrowRight,
   CornerDownRight,
-  Zap,
   TrendingUp,
   CalendarDays,
   BadgeCheck,
   AlertTriangle,
   FlaskConical,
   Play,
-  Hotel,
   XCircle,
+  Check,
 } from "lucide-react";
 
-// --- Configuration ---
-// Define the model for Step 2 in advance
-export const GEMINI_MODEL = "gemini-3.0-pro";
+// --- API & Env Configuration ---
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
+const GEMINI_MODEL = import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-pro";
 
-// --- Original Design tokens ---
+// --- System Prompts & Context ---
+const SYSTEM_PROMPT_A = `You are a highly efficient and directive travel assistant.
+Your goal is to provide complete, detailed travel itineraries immediately based on the user's request.
+Do not ask follow-up questions unless absolutely necessary. Give the user exactly what they ask for in a structured, comprehensive format.`;
+
+const SYSTEM_PROMPT_B = `You are a maieutic, Socratic travel planner. 
+Your goal is to help the user design a trip by extracting their constraints (budget, destination, dates, dietary requirements) step by step.
+CRITICAL RULES:
+1. NEVER provide a complete itinerary immediately.
+2. Ask ONE probing question at a time to uncover missing preferences.
+3. Guide the user gently but firmly to consider aspects of their trip they might have forgotten.
+4. Keep your responses conversational, concise, and focused on eliciting the next constraint.`;
+
+// Placeholder for the travel plan state (Will be expanded in Step 3)
+const getTravelContextString = (condition: "A" | "B") => {
+  if (condition === "A")
+    return "Context: No active constraints tracked in baseline.";
+  return `CURRENT TRAVEL PLAN STATE:
+- Macro-Logistics: Pending
+- Basecamp Selection: Pending
+- Micro-Logistics: Pending
+Focus on extracting Macro-Logistics (Destination, Duration, Budget) first.`;
+};
+
+// --- Design tokens ---
 const T = "#0B7A75";
 const T_LIGHT = "#EDF7F6";
 const T_BORDER = "#A7D9D6";
@@ -33,113 +51,137 @@ const GREEN_BORDER = "#86EFAC";
 const RED = "#DC2626";
 const RED_LIGHT = "#FEF2F2";
 const RED_BORDER = "#FECACA";
-const AMBER = "#D97706";
-const AMBER_LIGHT = "#FFFBEB";
-const AMBER_BORDER = "#FCD34D";
 const BUBBLE_BG = "#E9EEF6";
 const BUBBLE_BORDER = "#C5CEDC";
-const MUTED_BG = "#ECEEF2";
-const MUTED_BORDER = "#D4D9E3";
 const METRICS_BG = "#E5EBF3";
 const METRIC_CARD = "#F2F5FA";
 const METRIC_BORDER = "#BEC9DA";
 const PREFS_BG = "#DDE5F0";
 
-// --- Shared prototype state ---
+// --- Shared Types ---
 interface S {
   condition: "A" | "B";
-  glutenFree: boolean;
-  accomTier: string | null;
-  selectedHotel: string | null;
-  editApplied: boolean;
+  participantId: string;
+  researcher: string;
 }
 
-// --- Chat Message Type ---
 export type Message = {
   id: string;
   text: string;
   sender: "user" | "ai";
+  timestamp: string;
+  wordCount: number;
 };
 
-// --- Static data ---
-const DAY_HOTELS = {
-  zurich: { hotel: "Hotel Adler Zürich", spend: "85 CHF" },
-  paris: { hotel: "Hôtel Grands Hommes", spend: "145 CHF" },
-  amsterdam: { hotel: "Hotel V Nesplein", spend: "95 CHF" },
-  barcelona: { hotel: "Hotel Barcino Central", spend: "110 CHF" },
+// --- Helper Functions ---
+const countWords = (str: string) => {
+  return str
+    .trim()
+    .split(/\s+/)
+    .filter((word) => word.length > 0).length;
 };
-const ACTIVE_PREFS = [
-  "Europe",
-  "7 Days",
-  "1,500 CHF",
-  "Diet: Gluten-free",
-  "3-Star",
-];
-const DAY2_BASE = [
-  { time: "09:00", name: "Eiffel Tower", note: "~2 hrs" },
-  { time: "12:30", name: "Lunch – Café de Flore", note: "GF ✓" },
-  { time: "15:00", name: "Louvre Museum", note: "~3 hrs" },
-  { time: "19:00", name: "Dinner – Le Comptoir", note: "GF ✓" },
-];
-const DAY2_UPDATED = [
-  { time: "09:00", name: "Eiffel Tower", note: "~2 hrs", changed: false },
-  {
-    time: "12:30",
-    name: "Lunch – Café de Flore",
-    note: "GF ✓",
-    changed: false,
-  },
-  { time: "15:00", name: "Musée d'Orsay", note: "~2.5 hrs", changed: true },
-  { time: "19:00", name: "Dinner – Le Comptoir", note: "GF ✓", changed: false },
-];
 
-// --- Chat primitives ---
-function ChatHeader({
-  editMode = false,
-  onEndSession,
-}: {
-  editMode?: boolean;
-  onEndSession?: () => void;
-}) {
-  if (editMode) {
-    return (
-      <div className="flex-shrink-0 border-b border-gray-100 flex justify-between items-center pr-5">
-        <div>
-          <div className="px-5 py-2.5 flex items-center gap-2">
-            <div className="w-2 h-2 rounded-sm" style={{ background: T }} />
-            <span
-              className="text-xs font-bold tracking-widest uppercase"
-              style={{ color: T }}
-            >
-              Editing: Day 2
-            </span>
-          </div>
-          <div
-            className="px-5 py-1 flex items-center gap-1.5 border-t"
-            style={{ background: T_LIGHT, borderColor: T_BORDER }}
-          >
-            <CornerDownRight
-              className="w-3 h-3 flex-shrink-0"
-              style={{ color: T }}
-            />
-            <span className="text-[11px] font-medium" style={{ color: T }}>
-              Focused on Day 2 – Paris
-            </span>
-          </div>
-        </div>
-        {onEndSession && (
-          <button
-            onClick={onEndSession}
-            className="flex items-center gap-1.5 text-xs font-medium text-red-500 hover:text-red-700 transition-colors"
-          >
-            <XCircle className="w-4 h-4" /> End Session
-          </button>
-        )}
-      </div>
-    );
+const getTimestamp = () => new Date().toISOString();
+
+const generateCSVAndDownload = (
+  participantId: string,
+  researcher: string,
+  condition: string,
+  sessionStartStr: string,
+  durationSec: number,
+  messages: Message[],
+) => {
+  const userTurns = messages.filter((m) => m.sender === "user").length;
+
+  // CSV Headers
+  let csvContent =
+    "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,MsgID,Role,Timestamp,WordCount,Content\n";
+
+  // Escape function for CSV content
+  const escapeCSV = (str: string) => `"${str.replace(/"/g, '""')}"`;
+
+  messages.forEach((msg) => {
+    const row = [
+      escapeCSV(participantId),
+      escapeCSV(researcher),
+      condition,
+      sessionStartStr,
+      durationSec,
+      userTurns,
+      msg.id,
+      msg.sender,
+      msg.timestamp,
+      msg.wordCount,
+      escapeCSV(msg.text),
+    ];
+    csvContent += row.join(",") + "\n";
+  });
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute(
+    "download",
+    `VoyagerLab_Log_${participantId}_Cond${condition}_${Date.now()}.csv`,
+  );
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+// --- API Call Logic ---
+const callGeminiAPI = async (chatHistory: Message[], condition: "A" | "B") => {
+  if (!GEMINI_API_KEY) {
+    return "API Key is missing. Please set VITE_GEMINI_API_KEY in your .env.local file.";
   }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const systemInstruction =
+    condition === "A" ? SYSTEM_PROMPT_A : SYSTEM_PROMPT_B;
+  const contextString = getTravelContextString(condition);
+  const fullSystemPrompt = `${systemInstruction}\n\n${contextString}`;
+
+  // Map history to Gemini format (ignoring 'init' placeholder)
+  const contents = chatHistory
+    .filter((msg) => msg.id !== "init")
+    .map((msg) => ({
+      role: msg.sender === "user" ? "user" : "model",
+      parts: [{ text: msg.text }],
+    }));
+
+  const payload = {
+    system_instruction: { parts: [{ text: fullSystemPrompt }] },
+    contents: contents,
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      console.error("Gemini API Error:", data.error);
+      return `Error: ${data.error.message}`;
+    }
+
+    return data.candidates[0].content.parts[0].text;
+  } catch (error) {
+    console.error("Fetch Error:", error);
+    return "Connection error while reaching the Gemini API.";
+  }
+};
+
+// ─── UI Primitives ─────────────────────────────────────────────────────────────
+
+function ChatHeader({ onEndSession }: { onEndSession?: () => void }) {
   return (
-    <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between flex-shrink-0">
+    <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between flex-shrink-0 bg-white z-10 relative">
       <div className="flex items-center gap-2.5">
         <div
           className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0"
@@ -152,7 +194,7 @@ function ChatHeader({
       {onEndSession && (
         <button
           onClick={onEndSession}
-          className="flex items-center gap-1.5 text-xs font-medium text-red-500 hover:text-red-700 transition-colors"
+          className="flex items-center gap-1.5 text-xs font-medium text-red-500 hover:text-red-700 hover:bg-red-50 px-2 py-1 rounded transition-colors"
         >
           <XCircle className="w-4 h-4" /> End Session
         </button>
@@ -161,65 +203,22 @@ function ChatHeader({
   );
 }
 
-function AIBubble({
-  children,
-  muted = false,
-}: {
-  children: React.ReactNode;
-  muted?: boolean;
-}) {
+function AIBubble({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex gap-2.5 mb-3">
       <div
         className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center mt-0.5"
-        style={{ background: muted ? "#9CA3AF" : T }}
+        style={{ background: T }}
       >
         <Sparkles className="w-3.5 h-3.5 text-white" />
       </div>
       <div
-        className="rounded-2xl rounded-tl-none px-4 py-2.5 text-sm leading-relaxed"
-        style={
-          muted
-            ? {
-                background: MUTED_BG,
-                border: `1px solid ${MUTED_BORDER}`,
-                color: "#9CA3AF",
-                maxWidth: "85%",
-              }
-            : {
-                background: BUBBLE_BG,
-                border: `1px solid ${BUBBLE_BORDER}`,
-                color: "#374151",
-                maxWidth: "85%",
-              }
-        }
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function UserBubble({
-  children,
-  auto = false,
-  muted = false,
-}: {
-  children: React.ReactNode;
-  auto?: boolean;
-  muted?: boolean;
-}) {
-  return (
-    <div className="flex justify-end items-end gap-2 mb-3">
-      {auto && !muted && (
-        <span className="text-[10px] text-gray-400">via widget ⚡</span>
-      )}
-      <div
-        className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed"
+        className="rounded-2xl rounded-tl-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
         style={{
-          background: muted ? "#9CA3AF" : auto ? "#0F9D82" : T,
-          color: "white",
-          maxWidth: "80%",
+          background: BUBBLE_BG,
+          border: `1px solid ${BUBBLE_BORDER}`,
+          color: "#374151",
+          maxWidth: "85%",
         }}
       >
         {children}
@@ -228,40 +227,62 @@ function UserBubble({
   );
 }
 
-// Unified Chat Input Component
-function ChatInputBar({ onSend }: { onSend: (msg: string) => void }) {
+function UserBubble({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex justify-end items-end gap-2 mb-3">
+      <div
+        className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
+        style={{ background: T, color: "white", maxWidth: "80%" }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ChatInputBar({
+  onSend,
+  disabled,
+}: {
+  onSend: (msg: string) => void;
+  disabled?: boolean;
+}) {
   const [text, setText] = useState("");
 
   const handleSend = () => {
-    if (text.trim() === "") return;
+    if (text.trim() === "" || disabled) return;
     onSend(text);
     setText("");
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      handleSend();
-    }
+    if (e.key === "Enter") handleSend();
   };
 
   return (
-    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white">
+    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white z-10 relative">
       <div
-        className="flex items-center gap-2.5 rounded-xl px-4 py-2.5 border"
-        style={{ background: "#F9FAFB", borderColor: "#E5E7EB" }}
+        className="flex items-center gap-2.5 rounded-xl px-4 py-2.5 border transition-opacity"
+        style={{
+          background: "#F9FAFB",
+          borderColor: "#E5E7EB",
+          opacity: disabled ? 0.6 : 1,
+        }}
       >
         <input
           type="text"
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Type a message..."
+          disabled={disabled}
+          placeholder={disabled ? "AI is thinking..." : "Type a message..."}
           className="flex-1 text-sm bg-transparent outline-none text-gray-700"
         />
         <button
           onClick={handleSend}
-          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer"
-          style={{ background: T }}
+          disabled={disabled}
+          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer disabled:pointer-events-none"
+          style={{ background: disabled ? "#9CA3AF" : T }}
         >
           <ArrowRight className="w-4 h-4 text-white" />
         </button>
@@ -270,16 +291,18 @@ function ChatInputBar({ onSend }: { onSend: (msg: string) => void }) {
   );
 }
 
-// --- Right panel components ---
-type MC = {
-  label: string;
-  value: string;
-  sub: string;
-  icon: React.ReactNode;
-  green?: boolean;
-  red?: boolean;
-};
-function MetricsGrid({ metrics }: { metrics: MC[] }) {
+// ─── Right Panel Components (Condition B) ──────────────────────────────────────
+
+function MetricsGrid() {
+  const I_N = <span className="text-[10px] text-gray-300">CHF</span>;
+  const I_BG = <BadgeCheck className="w-3.5 h-3.5 text-gray-300" />;
+  const I_C = <CalendarDays className="w-3.5 h-3.5 text-gray-400" />;
+  const metrics = [
+    { label: "Est. Cost", value: "0 CHF", sub: "awaiting input", icon: I_N },
+    { label: "Satisfied Prefs", value: "0", sub: "none captured", icon: I_BG },
+    { label: "Days Planned", value: "0", sub: "route pending", icon: I_C },
+  ];
+
   return (
     <div
       className="border-b border-gray-200 flex-shrink-0"
@@ -300,13 +323,7 @@ function MetricsGrid({ metrics }: { metrics: MC[] }) {
             <div
               key={m.label}
               className="rounded-2xl px-4 py-3 border"
-              style={
-                m.red
-                  ? { background: RED_LIGHT, borderColor: RED_BORDER }
-                  : m.green
-                    ? { background: GREEN_LIGHT, borderColor: GREEN_BORDER }
-                    : { background: METRIC_CARD, borderColor: METRIC_BORDER }
-              }
+              style={{ background: METRIC_CARD, borderColor: METRIC_BORDER }}
             >
               <div className="flex items-center gap-1.5 mb-1">
                 {m.icon}
@@ -314,18 +331,10 @@ function MetricsGrid({ metrics }: { metrics: MC[] }) {
                   {m.label}
                 </span>
               </div>
-              <div
-                className="text-2xl font-bold leading-none"
-                style={{ color: m.red ? RED : m.green ? GREEN : "#1A1D23" }}
-              >
+              <div className="text-2xl font-bold leading-none text-gray-800">
                 {m.value}
               </div>
-              <div
-                className="text-[10px] mt-1"
-                style={{ color: m.red ? RED : m.green ? GREEN : "#9CA3AF" }}
-              >
-                {m.sub}
-              </div>
+              <div className="text-[10px] mt-1 text-gray-400">{m.sub}</div>
             </div>
           ))}
         </div>
@@ -334,22 +343,7 @@ function MetricsGrid({ metrics }: { metrics: MC[] }) {
   );
 }
 
-const I_N = <span className="text-[10px] text-gray-300">CHF</span>;
-const I_BG = <BadgeCheck className="w-3.5 h-3.5 text-gray-300" />;
-const I_C = <CalendarDays className="w-3.5 h-3.5 text-gray-400" />;
-const M_EMPTY: MC[] = [
-  { label: "Est. Cost", value: "0 CHF", sub: "awaiting input", icon: I_N },
-  { label: "Satisfied Prefs", value: "0", sub: "none captured", icon: I_BG },
-  { label: "Days Planned", value: "4", sub: "Europe route", icon: I_C },
-];
-
-function PreferencesSection({
-  empty = false,
-  tags = [],
-}: {
-  empty?: boolean;
-  tags?: string[];
-}) {
+function PreferencesSection() {
   return (
     <div
       className="flex-shrink-0 border-t border-gray-200 px-6 py-3"
@@ -361,47 +355,25 @@ function PreferencesSection({
       >
         Active User Preferences / Constraints
       </div>
-      {empty ? (
-        <p className="text-xs italic" style={{ color: "#7A90AA" }}>
-          No extra preferences captured yet.
-        </p>
-      ) : (
-        <div className="flex flex-wrap gap-1.5">
-          {tags.map((tag) => (
-            <span
-              key={tag}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
-              style={{ background: T }}
-            >
-              <Check className="w-3 h-3" />
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
+      <p className="text-xs italic" style={{ color: "#7A90AA" }}>
+        No extra preferences captured yet.
+      </p>
     </div>
   );
 }
 
-// ─── 1. ROOT APP COMPONENT (Routing Logic) ────────────────────────────────────
+// ─── 1. ROOT APP COMPONENT ───────────────────────────────────────────────────
 
 export default function App() {
   const [sessionActive, setSessionActive] = useState(false);
   const [state, setState] = useState<S>({
-    condition: "B", // Default to Condition B
-    glutenFree: false,
-    accomTier: null,
-    selectedHotel: null,
-    editApplied: false,
+    condition: "B",
+    participantId: "",
+    researcher: "",
   });
 
   const updateState = (patch: Partial<S>) =>
     setState((s) => ({ ...s, ...patch }));
-
-  const endSession = () => {
-    // In step 4, the JSON export logic will be triggered here
-    setSessionActive(false);
-  };
 
   return (
     <div
@@ -416,16 +388,22 @@ export default function App() {
             onLaunch={() => setSessionActive(true)}
           />
         ) : state.condition === "A" ? (
-          <ConditionAScreen onEndSession={endSession} />
+          <ConditionAScreen
+            state={state}
+            onEndSession={() => setSessionActive(false)}
+          />
         ) : (
-          <ConditionBScreen onEndSession={endSession} />
+          <ConditionBScreen
+            state={state}
+            onEndSession={() => setSessionActive(false)}
+          />
         )}
       </div>
     </div>
   );
 }
 
-// ─── 2. START SCREEN (Setup & Validation) ─────────────────────────────────────
+// ─── 2. START SCREEN ─────────────────────────────────────────────────────────
 
 function SetupScreen({
   state,
@@ -437,17 +415,13 @@ function SetupScreen({
   onLaunch: () => void;
 }) {
   const [launching, setLaunching] = useState(false);
-  const [participantId, setParticipantId] = useState("");
-  const [researcher, setResearcher] = useState("");
   const [validationError, setValidationError] = useState(false);
 
   const handleLaunch = () => {
-    // Validation: Require both inputs before starting
-    if (participantId.trim() === "" || researcher.trim() === "") {
+    if (state.participantId.trim() === "" || state.researcher.trim() === "") {
       setValidationError(true);
       return;
     }
-
     setValidationError(false);
     setLaunching(true);
     setTimeout(() => {
@@ -469,12 +443,13 @@ function SetupScreen({
           <label className="flex items-center gap-2">
             <span className="text-xs text-gray-500">Participant ID:</span>
             <input
-              value={participantId}
-              onChange={(e) => setParticipantId(e.target.value)}
+              value={state.participantId}
+              onChange={(e) => update({ participantId: e.target.value })}
               className="border rounded-lg px-2.5 py-1.5 text-xs font-mono text-gray-700 bg-white focus:outline-none transition-colors"
               style={{
                 width: 100,
-                borderColor: validationError && !participantId ? RED : T_BORDER,
+                borderColor:
+                  validationError && !state.participantId ? RED : T_BORDER,
               }}
               placeholder="e.g. P-042"
             />
@@ -483,12 +458,13 @@ function SetupScreen({
           <label className="flex items-center gap-2">
             <span className="text-xs text-gray-500">Researcher:</span>
             <input
-              value={researcher}
-              onChange={(e) => setResearcher(e.target.value)}
+              value={state.researcher}
+              onChange={(e) => update({ researcher: e.target.value })}
               className="border rounded-lg px-2.5 py-1.5 text-xs text-gray-700 bg-white focus:outline-none transition-colors"
               style={{
                 width: 130,
-                borderColor: validationError && !researcher ? RED : "#E5E7EB",
+                borderColor:
+                  validationError && !state.researcher ? RED : "#E5E7EB",
               }}
               placeholder="Name..."
             />
@@ -558,19 +534,6 @@ function SetupScreen({
                         ? "Directive Vanilla LLM Baseline"
                         : "Maieutic Socratic Planner"}
                     </span>
-                    {cond === "B" && (
-                      <span
-                        className="text-[10px] font-bold px-2 py-0.5 rounded-full text-white"
-                        style={{ background: T }}
-                      >
-                        Experimental
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-xs text-gray-400 mt-1">
-                    {cond === "A"
-                      ? "Standard prompt-response. Full itinerary generated instantly. No interactive UI or preference capture."
-                      : "AI-guided preference elicitation with dynamic UI, live metrics grid, and conflict resolution protocols."}
                   </div>
                 </div>
               </label>
@@ -581,10 +544,7 @@ function SetupScreen({
               style={{ background: T, opacity: launching ? 0.75 : 1 }}
             >
               {launching ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Starting session...
-                </>
+                "Starting session..."
               ) : (
                 <>
                   <Play className="w-4 h-4" />
@@ -601,29 +561,70 @@ function SetupScreen({
 
 // ─── 3. CONDITION A (Baseline) ────────────────────────────────────────────────
 
-function ConditionAScreen({ onEndSession }: { onEndSession: () => void }) {
+function ConditionAScreen({
+  state,
+  onEndSession,
+}: {
+  state: S;
+  onEndSession: () => void;
+}) {
   const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Telemetry references
+  const sessionStartTime = useRef<number>(Date.now());
+  const sessionStartStr = useRef<string>(new Date().toISOString());
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to the bottom when messages update
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleSendMessage = (text: string) => {
-    const newUserMsg: Message = {
+  const handleSendMessage = async (text: string) => {
+    const userMsg: Message = {
       id: Date.now().toString(),
       text,
       sender: "user",
+      timestamp: getTimestamp(),
+      wordCount: countWords(text),
     };
-    setMessages((prev) => [...prev, newUserMsg]);
 
-    // In Step 2: Call the Gemini API here
+    const newHistory = [...messages, userMsg];
+    setMessages(newHistory);
+    setIsLoading(true);
+
+    const aiResponseText = await callGeminiAPI(newHistory, "A");
+
+    const aiMsg: Message = {
+      id: (Date.now() + 1).toString(),
+      text: aiResponseText,
+      sender: "ai",
+      timestamp: getTimestamp(),
+      wordCount: countWords(aiResponseText),
+    };
+
+    setMessages((prev) => [...prev, aiMsg]);
+    setIsLoading(false);
+  };
+
+  const handleEndSession = () => {
+    const durationSec = Math.round(
+      (Date.now() - sessionStartTime.current) / 1000,
+    );
+    generateCSVAndDownload(
+      state.participantId,
+      state.researcher,
+      "A",
+      sessionStartStr.current,
+      durationSec,
+      messages,
+    );
+    onEndSession();
   };
 
   return (
     <div className="h-full flex flex-col bg-white w-1/2 mx-auto border-x border-gray-200 shadow-xl relative">
-      <ChatHeader onEndSession={onEndSession} />
+      <ChatHeader onEndSession={handleEndSession} />
 
       <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col">
         {messages.length === 0 ? (
@@ -643,56 +644,97 @@ function ConditionAScreen({ onEndSession }: { onEndSession: () => void }) {
         <div ref={messagesEndRef} />
       </div>
 
-      <ChatInputBar onSend={handleSendMessage} />
+      <ChatInputBar onSend={handleSendMessage} disabled={isLoading} />
     </div>
   );
 }
 
 // ─── 4. CONDITION B (Socratic Planner) ────────────────────────────────────────
 
-function ConditionBScreen({ onEndSession }: { onEndSession: () => void }) {
+function ConditionBScreen({
+  state,
+  onEndSession,
+}: {
+  state: S;
+  onEndSession: () => void;
+}) {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "init",
       text: "Describe your dream trip and I'll build your personalised itinerary step by step.",
       sender: "ai",
+      timestamp: getTimestamp(),
+      wordCount: 0,
     },
   ]);
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Telemetry references
+  const sessionStartTime = useRef<number>(Date.now());
+  const sessionStartStr = useRef<string>(new Date().toISOString());
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to the bottom when messages update
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleSendMessage = (text: string) => {
-    const newUserMsg: Message = {
+  const handleSendMessage = async (text: string) => {
+    const userMsg: Message = {
       id: Date.now().toString(),
       text,
       sender: "user",
+      timestamp: getTimestamp(),
+      wordCount: countWords(text),
     };
 
-    setMessages((prev) => {
-      // Remove the initial welcome box if it's the first message from the user
-      const filteredMessages = prev.filter((m) => m.id !== "init");
-      return [...filteredMessages, newUserMsg];
-    });
+    // Filter out the "init" placeholder on the first real message
+    const filteredPrev = messages.filter((m) => m.id !== "init");
+    const newHistory = [...filteredPrev, userMsg];
 
-    // In Step 2: Call the Gemini API here
+    setMessages(newHistory);
+    setIsLoading(true);
+
+    const aiResponseText = await callGeminiAPI(newHistory, "B");
+
+    const aiMsg: Message = {
+      id: (Date.now() + 1).toString(),
+      text: aiResponseText,
+      sender: "ai",
+      timestamp: getTimestamp(),
+      wordCount: countWords(aiResponseText),
+    };
+
+    setMessages((prev) => [...prev, aiMsg]);
+    setIsLoading(false);
+  };
+
+  const handleEndSession = () => {
+    const durationSec = Math.round(
+      (Date.now() - sessionStartTime.current) / 1000,
+    );
+    // Ignore the init message in the final export
+    const exportMessages = messages.filter((m) => m.id !== "init");
+    generateCSVAndDownload(
+      state.participantId,
+      state.researcher,
+      "B",
+      sessionStartStr.current,
+      durationSec,
+      exportMessages,
+    );
+    onEndSession();
   };
 
   return (
     <div className="h-full flex w-full">
-      {/* Left Sidebar: Chat */}
-      <div className="w-1/3 flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10">
-        <ChatHeader onEndSession={onEndSession} />
+      <div className="w-1/3 flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10 relative">
+        <ChatHeader onEndSession={handleEndSession} />
 
         <div className="flex-1 flex flex-col overflow-y-auto px-5 pt-4 pb-2">
           {messages.map((msg) => {
             if (msg.sender === "user") {
               return <UserBubble key={msg.id}>{msg.text}</UserBubble>;
             } else {
-              // Render initial placeholder box
               if (msg.id === "init") {
                 return (
                   <div
@@ -718,15 +760,13 @@ function ConditionBScreen({ onEndSession }: { onEndSession: () => void }) {
           <div ref={messagesEndRef} />
         </div>
 
-        <ChatInputBar onSend={handleSendMessage} />
+        <ChatInputBar onSend={handleSendMessage} disabled={isLoading} />
       </div>
 
-      {/* Right Panel: Socratic Dashboard */}
       <div className="flex-1 flex flex-col" style={{ background: "#F8FAFC" }}>
-        <MetricsGrid metrics={M_EMPTY} />
+        <MetricsGrid />
 
         <div className="flex-1 flex items-center justify-center px-8 relative overflow-y-auto">
-          {/* OpenUI components will be rendered here in Step 3 */}
           <div className="text-center max-w-sm">
             <div
               className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
@@ -741,7 +781,7 @@ function ConditionBScreen({ onEndSession }: { onEndSession: () => void }) {
           </div>
         </div>
 
-        <PreferencesSection empty />
+        <PreferencesSection />
       </div>
     </div>
   );
