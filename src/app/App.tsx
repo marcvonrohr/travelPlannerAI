@@ -1,47 +1,60 @@
 import React, { useState, KeyboardEvent, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
 import {
+  Pencil,
+  ChevronDown,
+  ChevronRight,
+  ChevronLeft,
+  Check,
   Sparkles,
   ArrowRight,
   CornerDownRight,
+  Zap,
   TrendingUp,
   CalendarDays,
   BadgeCheck,
   AlertTriangle,
   FlaskConical,
   Play,
+  Hotel,
   XCircle,
-  Check,
 } from "lucide-react";
 
-// --- API & Env Configuration ---
+// --- Configuration ---
+export const GEMINI_MODEL =
+  import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-pro";
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
-const GEMINI_MODEL = import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-pro";
 
-// --- System Prompts & Context ---
+// --- System Prompts & Context (The "Brain" of our Generative UI) ---
 const SYSTEM_PROMPT_A = `You are a highly efficient and directive travel assistant.
 Your goal is to provide complete, detailed travel itineraries immediately based on the user's request.
-Do not ask follow-up questions unless absolutely necessary. Give the user exactly what they ask for in a structured, comprehensive format.`;
+Give the user exactly what they ask for in a structured, comprehensive markdown format. Do not ask endless follow-up questions. Provide the full plan quickly.
+Reply in English.`;
 
-const SYSTEM_PROMPT_B = `You are a maieutic, Socratic travel planner. 
-Your goal is to help the user design a trip by extracting their constraints (budget, destination, dates, dietary requirements) step by step.
-CRITICAL RULES:
-1. NEVER provide a complete itinerary immediately.
-2. Ask ONE probing question at a time to uncover missing preferences.
-3. Guide the user gently but firmly to consider aspects of their trip they might have forgotten.
-4. Keep your responses conversational, concise, and focused on eliciting the next constraint.`;
+const SYSTEM_PROMPT_B = `You are a maieutic, Socratic travel planner powered by Augmented Intelligence.
+Your goal is to extract the user's constraints (budget, destination, dates, dietary) step by step, and then propose a highly adaptable itinerary.
 
-// Placeholder for the travel plan state (Will be expanded in Step 3)
-const getTravelContextString = (condition: "A" | "B") => {
+CRITICAL RULES FOR SOCRATIC MODE:
+1. Don't ask endless questions. Ask 1-2 questions to get the basics (Destination, Budget, Duration, Group), then PROPOSE a high-level plan.
+2. Once you propose a plan, allow the user to adjust specific days or budgets.
+3. OPENUI GENERATION: You have the ability to render interactive UI widgets directly in the chat. To do this, output the exact tags below on a new line. 
+   - When suggesting hotel tiers, output: <UI_HOTEL_SELECTION />
+   - When the user asks for an expensive adjustment that exceeds the budget (e.g., an Alpine Helicopter Tour), YOU MUST WARN THEM and output: <UI_CONFLICT />
+   - When suggesting quick edits to a specific day, output: <UI_SUGGESTION_CHIPS />
+4. STATE UPDATES: If the user confirms a preference (e.g., "Gluten-free" or "1500 CHF"), you must acknowledge it. The UI will extract it automatically.
+Reply in English. Keep text concise when using UI tags.`;
+
+const getTravelContextString = (condition: "A" | "B", state: S) => {
   if (condition === "A")
     return "Context: No active constraints tracked in baseline.";
-  return `CURRENT TRAVEL PLAN STATE:
-- Macro-Logistics: Pending
-- Basecamp Selection: Pending
-- Micro-Logistics: Pending
-Focus on extracting Macro-Logistics (Destination, Duration, Budget) first.`;
+  return `CURRENT CONTEXT & KNOWN CONSTRAINTS:
+- Gluten-free requested: ${state.glutenFree ? "Yes" : "No"}
+- Accommodation Tier: ${state.accomTier || "Pending"}
+- Budget Status: ${state.conflictActive ? "OVER BUDGET" : "Within limits"}
+Use this context to guide your response.`;
 };
 
-// --- Design tokens ---
+// --- Design tokens (From Figma) ---
 const T = "#0B7A75";
 const T_LIGHT = "#EDF7F6";
 const T_BORDER = "#A7D9D6";
@@ -51,6 +64,9 @@ const GREEN_BORDER = "#86EFAC";
 const RED = "#DC2626";
 const RED_LIGHT = "#FEF2F2";
 const RED_BORDER = "#FECACA";
+const AMBER = "#D97706";
+const AMBER_LIGHT = "#FFFBEB";
+const AMBER_BORDER = "#FCD34D";
 const BUBBLE_BG = "#E9EEF6";
 const BUBBLE_BORDER = "#C5CEDC";
 const METRICS_BG = "#E5EBF3";
@@ -63,6 +79,11 @@ interface S {
   condition: "A" | "B";
   participantId: string;
   researcher: string;
+  glutenFree: boolean;
+  accomTier: string | null;
+  selectedHotel: string | null;
+  editApplied: boolean;
+  conflictActive: boolean;
 }
 
 export type Message = {
@@ -74,13 +95,11 @@ export type Message = {
 };
 
 // --- Helper Functions ---
-const countWords = (str: string) => {
-  return str
+const countWords = (str: string) =>
+  str
     .trim()
     .split(/\s+/)
     .filter((word) => word.length > 0).length;
-};
-
 const getTimestamp = () => new Date().toISOString();
 
 const generateCSVAndDownload = (
@@ -92,12 +111,8 @@ const generateCSVAndDownload = (
   messages: Message[],
 ) => {
   const userTurns = messages.filter((m) => m.sender === "user").length;
-
-  // CSV Headers
   let csvContent =
     "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,MsgID,Role,Timestamp,WordCount,Content\n";
-
-  // Escape function for CSV content
   const escapeCSV = (str: string) => `"${str.replace(/"/g, '""')}"`;
 
   messages.forEach((msg) => {
@@ -130,20 +145,27 @@ const generateCSVAndDownload = (
   document.body.removeChild(link);
 };
 
-// --- API Call Logic ---
-const callGeminiAPI = async (chatHistory: Message[], condition: "A" | "B") => {
+// --- Streaming API Call with Auto-Retry ---
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const callGeminiAPIStream = async (
+  chatHistory: Message[],
+  condition: "A" | "B",
+  state: S,
+  onChunk: (chunk: string) => void,
+) => {
   if (!GEMINI_API_KEY) {
-    return "API Key is missing. Please set VITE_GEMINI_API_KEY in your .env.local file.";
+    onChunk(
+      "API Key is missing. Please set VITE_GEMINI_API_KEY in your .env.local file.",
+    );
+    return;
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
   const systemInstruction =
     condition === "A" ? SYSTEM_PROMPT_A : SYSTEM_PROMPT_B;
-  const contextString = getTravelContextString(condition);
-  const fullSystemPrompt = `${systemInstruction}\n\n${contextString}`;
+  const fullSystemPrompt = `${systemInstruction}\n\n${getTravelContextString(condition, state)}`;
 
-  // Map history to Gemini format (ignoring 'init' placeholder)
   const contents = chatHistory
     .filter((msg) => msg.id !== "init")
     .map((msg) => ({
@@ -156,24 +178,57 @@ const callGeminiAPI = async (chatHistory: Message[], condition: "A" | "B") => {
     contents: contents,
   };
 
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+  let retries = 3;
+  let delay = 1000;
 
-    const data = await response.json();
+  while (retries > 0) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-    if (data.error) {
-      console.error("Gemini API Error:", data.error);
-      return `Error: ${data.error.message}`;
+      if (response.status === 503) {
+        throw new Error("503");
+      }
+
+      if (!response.body) throw new Error("No response body");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const dataStr = line.slice(6);
+            if (dataStr === "[DONE]") continue;
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.candidates && data.candidates[0].content.parts[0].text) {
+                onChunk(data.candidates[0].content.parts[0].text);
+              }
+            } catch (e) {
+              /* Ignore broken json chunks in stream */
+            }
+          }
+        }
+      }
+      return; // Success, exit retry loop
+    } catch (error: any) {
+      if (error.message === "503" && retries > 1) {
+        retries--;
+        await sleep(delay);
+        delay *= 2; // Exponential backoff
+      } else {
+        onChunk("\n*[Network Error: Please try again]*");
+        return;
+      }
     }
-
-    return data.candidates[0].content.parts[0].text;
-  } catch (error) {
-    console.error("Fetch Error:", error);
-    return "Connection error while reaching the Gemini API.";
   }
 };
 
@@ -203,7 +258,62 @@ function ChatHeader({ onEndSession }: { onEndSession?: () => void }) {
   );
 }
 
-function AIBubble({ children }: { children: React.ReactNode }) {
+// ─── OpenUI Renderer (The Generative UI Magic) ───────────────────────────────
+// This function parses the AI text and replaces OpenUI tags with actual React components
+const renderMessageWithOpenUI = (
+  text: string,
+  state: S,
+  update: (patch: Partial<S>) => void,
+) => {
+  const parts = text.split(/(<UI_[A-Z_]+\s*\/>)/g);
+
+  return parts.map((part, index) => {
+    if (part.includes("<UI_HOTEL_SELECTION />")) {
+      return (
+        <div key={index} className="my-4">
+          <AccommodationTier
+            selected={state.accomTier}
+            onSelect={(t) => update({ accomTier: t })}
+          />
+        </div>
+      );
+    }
+    if (part.includes("<UI_CONFLICT />")) {
+      // Auto-trigger conflict state if AI decides there's a conflict
+      if (!state.conflictActive)
+        setTimeout(() => update({ conflictActive: true }), 0);
+      return <ConflictResolutionWidget key={index} />;
+    }
+    if (part.includes("<UI_SUGGESTION_CHIPS />")) {
+      return (
+        <SuggestionChips
+          key={index}
+          chips={[
+            "Replace Louvre visit",
+            "Adjust meal times",
+            "Find GF breakfast",
+          ]}
+        />
+      );
+    }
+    // Default: Render Markdown for regular text
+    return (
+      <div key={index} className="prose prose-sm prose-slate max-w-none">
+        <ReactMarkdown>{part}</ReactMarkdown>
+      </div>
+    );
+  });
+};
+
+function AIBubble({
+  message,
+  state,
+  update,
+}: {
+  message: Message;
+  state: S;
+  update: (p: Partial<S>) => void;
+}) {
   return (
     <div className="flex gap-2.5 mb-3">
       <div
@@ -213,7 +323,7 @@ function AIBubble({ children }: { children: React.ReactNode }) {
         <Sparkles className="w-3.5 h-3.5 text-white" />
       </div>
       <div
-        className="rounded-2xl rounded-tl-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
+        className="rounded-2xl rounded-tl-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap overflow-hidden"
         style={{
           background: BUBBLE_BG,
           border: `1px solid ${BUBBLE_BORDER}`,
@@ -221,7 +331,7 @@ function AIBubble({ children }: { children: React.ReactNode }) {
           maxWidth: "85%",
         }}
       >
-        {children}
+        {renderMessageWithOpenUI(message.text, state, update)}
       </div>
     </div>
   );
@@ -248,41 +358,61 @@ function ChatInputBar({
   disabled?: boolean;
 }) {
   const [text, setText] = useState("");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const handleSend = () => {
     if (text.trim() === "" || disabled) return;
     onSend(text);
     setText("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto"; // reset height
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") handleSend();
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setText(e.target.value);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "auto";
+      // Max height approx 3 lines (e.g. 72px)
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 72)}px`;
+    }
   };
 
   return (
     <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white z-10 relative">
       <div
-        className="flex items-center gap-2.5 rounded-xl px-4 py-2.5 border transition-opacity"
+        className="flex items-end gap-2.5 rounded-xl px-4 py-2.5 border transition-opacity"
         style={{
           background: "#F9FAFB",
           borderColor: "#E5E7EB",
           opacity: disabled ? 0.6 : 1,
         }}
       >
-        <input
-          type="text"
+        <textarea
+          ref={textareaRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={handleInput}
           onKeyDown={handleKeyDown}
           disabled={disabled}
-          placeholder={disabled ? "AI is thinking..." : "Type a message..."}
-          className="flex-1 text-sm bg-transparent outline-none text-gray-700"
+          placeholder={
+            disabled
+              ? "AI is typing..."
+              : "Type a message... (Shift+Enter for new line)"
+          }
+          className="flex-1 text-sm bg-transparent outline-none text-gray-700 resize-none py-1"
+          style={{ minHeight: "28px", maxHeight: "72px" }}
+          rows={1}
         />
         <button
           onClick={handleSend}
-          disabled={disabled}
-          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer disabled:pointer-events-none"
-          style={{ background: disabled ? "#9CA3AF" : T }}
+          disabled={disabled || text.trim() === ""}
+          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer disabled:pointer-events-none mb-0.5"
+          style={{ background: disabled || text.trim() === "" ? "#9CA3AF" : T }}
         >
           <ArrowRight className="w-4 h-4 text-white" />
         </button>
@@ -291,16 +421,218 @@ function ChatInputBar({
   );
 }
 
+// ─── OpenUI Widget Components (from Figma) ───────────────────────────────────
+
+function AIMicroFrontend({
+  children,
+  label = "Quick Preferences",
+}: {
+  children: React.ReactNode;
+  label?: string;
+}) {
+  return (
+    <div
+      className="mt-2 mb-1 rounded-xl overflow-hidden flex-shrink-0"
+      style={{ border: `1.5px dashed ${T_BORDER}`, background: "#FAFFFE" }}
+    >
+      <div
+        className="px-3.5 py-1.5 flex items-center justify-between border-b"
+        style={{ borderColor: T_BORDER, background: T_LIGHT }}
+      >
+        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
+          {label}
+        </span>
+        <div className="flex items-center gap-1" style={{ color: T }}>
+          <Zap className="w-3 h-3" />
+          <span className="text-[9px] font-bold tracking-widest uppercase">
+            AI-generated
+          </span>
+        </div>
+      </div>
+      <div className="px-3.5 py-3">{children}</div>
+    </div>
+  );
+}
+
+function AccommodationTier({
+  selected,
+  onSelect,
+}: {
+  selected: string | null;
+  onSelect: (t: string) => void;
+}) {
+  const tiers = ["Hostel", "3-Star", "Luxury"];
+  const pos =
+    selected === "Hostel" ? "15%" : selected === "Luxury" ? "85%" : "50%";
+
+  return (
+    <AIMicroFrontend label="Hotel Selection">
+      <div className="flex gap-1 mb-2.5">
+        {tiers.map((t) => (
+          <button
+            key={t}
+            onClick={() => onSelect(t)}
+            className="flex-1 py-1 rounded-lg text-xs font-medium border transition-all"
+            style={
+              t === selected
+                ? { background: T, color: "white", borderColor: T }
+                : {
+                    background: "white",
+                    color: "#6B7280",
+                    borderColor: "#E5E7EB",
+                  }
+            }
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+      <div className="relative h-1.5 bg-gray-200 rounded-full">
+        <div
+          className="h-1.5 rounded-full transition-all duration-300"
+          style={{ width: pos, background: T }}
+        />
+        <div
+          className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-white border-2 shadow-sm transition-all duration-300"
+          style={{ left: pos, borderColor: T }}
+        />
+      </div>
+    </AIMicroFrontend>
+  );
+}
+
+function SuggestionChips({ chips }: { chips: string[] }) {
+  const [active, setActive] = useState<string | null>(null);
+  return (
+    <AIMicroFrontend label="Suggested Edits">
+      <div className="flex flex-wrap gap-2">
+        {chips.map((c) => (
+          <button
+            key={c}
+            onClick={() => setActive((a) => (a === c ? null : c))}
+            className="px-3 py-1.5 rounded-full text-xs font-medium border transition-all"
+            style={
+              active === c
+                ? { background: T, color: "white", borderColor: T }
+                : { background: "white", color: T, borderColor: T_BORDER }
+            }
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+    </AIMicroFrontend>
+  );
+}
+
+function ConflictResolutionWidget() {
+  const [chosen, setChosen] = useState<string | null>(null);
+  return (
+    <AIMicroFrontend label="Budget Conflict">
+      <div
+        className="flex items-center gap-2 rounded-xl px-3 py-2 mb-3"
+        style={{ background: AMBER_LIGHT, border: `1px solid ${AMBER_BORDER}` }}
+      >
+        <AlertTriangle
+          className="w-4 h-4 flex-shrink-0"
+          style={{ color: AMBER }}
+        />
+        <span className="text-xs font-bold" style={{ color: AMBER }}>
+          Budget Conflict Detected
+        </span>
+        <span
+          className="ml-auto text-[10px] font-bold"
+          style={{ color: AMBER }}
+        >
+          +150 CHF over limit
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {["Increase budget limit", "Swap an existing activity"].map((c) => (
+          <button
+            key={c}
+            onClick={() => setChosen((ch) => (ch === c ? null : c))}
+            className="px-3 py-1.5 rounded-full text-xs font-medium border transition-all"
+            style={
+              chosen === c
+                ? {
+                    background: c.includes("Increase") ? AMBER : T,
+                    color: "white",
+                    borderColor: c.includes("Increase") ? AMBER : T,
+                  }
+                : {
+                    background: "white",
+                    color: c.includes("Increase") ? AMBER : T,
+                    borderColor: c.includes("Increase")
+                      ? AMBER_BORDER
+                      : T_BORDER,
+                  }
+            }
+          >
+            {c}
+          </button>
+        ))}
+      </div>
+    </AIMicroFrontend>
+  );
+}
+
 // ─── Right Panel Components (Condition B) ──────────────────────────────────────
 
-function MetricsGrid() {
+type MC = {
+  label: string;
+  value: string;
+  sub: string;
+  icon: React.ReactNode;
+  green?: boolean;
+  red?: boolean;
+};
+function MetricsGrid({ state }: { state: S }) {
   const I_N = <span className="text-[10px] text-gray-300">CHF</span>;
-  const I_BG = <BadgeCheck className="w-3.5 h-3.5 text-gray-300" />;
+  const I_G = (
+    <span className="text-[10px]" style={{ color: GREEN }}>
+      CHF
+    </span>
+  );
+  const I_R = <AlertTriangle className="w-3.5 h-3.5" style={{ color: RED }} />;
+  const I_BT = <BadgeCheck className="w-3.5 h-3.5" style={{ color: T }} />;
   const I_C = <CalendarDays className="w-3.5 h-3.5 text-gray-400" />;
-  const metrics = [
-    { label: "Est. Cost", value: "0 CHF", sub: "awaiting input", icon: I_N },
-    { label: "Satisfied Prefs", value: "0", sub: "none captured", icon: I_BG },
-    { label: "Days Planned", value: "0", sub: "route pending", icon: I_C },
+
+  // Dynamically calculate metrics based on state
+  let cost = "0";
+  let costSub = "awaiting input";
+  let costIcon = I_N;
+  let costRed = false;
+  let costGreen = false;
+  let prefs = "0";
+  let prefsSub = "none captured";
+  let days = "0";
+  let daysSub = "route pending";
+
+  // Simulate parsing the conversation state into metrics
+  if (state.accomTier || state.glutenFree) {
+    cost = state.conflictActive ? "1,650" : "1,329";
+    costSub = state.conflictActive ? "150 over limit!" : "171 under budget";
+    costIcon = state.conflictActive ? I_R : I_G;
+    costRed = state.conflictActive;
+    costGreen = !state.conflictActive;
+    prefs = (state.accomTier ? 1 : 0) + (state.glutenFree ? 1 : 0) + "";
+    prefsSub = "captured";
+    days = "7";
+    daysSub = "Europe route";
+  }
+
+  const metrics: MC[] = [
+    {
+      label: "Est. Cost",
+      value: cost,
+      sub: costSub,
+      icon: costIcon,
+      red: costRed,
+      green: costGreen,
+    },
+    { label: "Satisfied Prefs", value: prefs, sub: prefsSub, icon: I_BT },
+    { label: "Days Planned", value: days, sub: daysSub, icon: I_C },
   ];
 
   return (
@@ -322,8 +654,14 @@ function MetricsGrid() {
           {metrics.map((m) => (
             <div
               key={m.label}
-              className="rounded-2xl px-4 py-3 border"
-              style={{ background: METRIC_CARD, borderColor: METRIC_BORDER }}
+              className="rounded-2xl px-4 py-3 border transition-colors"
+              style={
+                m.red
+                  ? { background: RED_LIGHT, borderColor: RED_BORDER }
+                  : m.green
+                    ? { background: GREEN_LIGHT, borderColor: GREEN_BORDER }
+                    : { background: METRIC_CARD, borderColor: METRIC_BORDER }
+              }
             >
               <div className="flex items-center gap-1.5 mb-1">
                 {m.icon}
@@ -331,10 +669,18 @@ function MetricsGrid() {
                   {m.label}
                 </span>
               </div>
-              <div className="text-2xl font-bold leading-none text-gray-800">
+              <div
+                className="text-2xl font-bold leading-none"
+                style={{ color: m.red ? RED : m.green ? GREEN : "#1A1D23" }}
+              >
                 {m.value}
               </div>
-              <div className="text-[10px] mt-1 text-gray-400">{m.sub}</div>
+              <div
+                className="text-[10px] mt-1 truncate"
+                style={{ color: m.red ? RED : m.green ? GREEN : "#9CA3AF" }}
+              >
+                {m.sub}
+              </div>
             </div>
           ))}
         </div>
@@ -343,21 +689,62 @@ function MetricsGrid() {
   );
 }
 
-function PreferencesSection() {
+function DayCardCollapsed({
+  day,
+  sub,
+  hotel,
+  spend,
+  warning = false,
+}: {
+  day: string;
+  sub: string;
+  hotel?: string;
+  spend?: string;
+  warning?: boolean;
+}) {
   return (
     <div
-      className="flex-shrink-0 border-t border-gray-200 px-6 py-3"
-      style={{ background: PREFS_BG }}
+      className="border rounded-2xl px-4 py-3 flex items-start gap-2 transition-colors hover:opacity-90 shadow-sm"
+      style={
+        warning
+          ? { borderColor: RED_BORDER, background: RED_LIGHT }
+          : { borderColor: "#E2E8F0", background: "#FAFCFF" }
+      }
     >
-      <div
-        className="text-[9px] font-bold tracking-widest uppercase mb-1.5"
-        style={{ color: "#5A7090" }}
-      >
-        Active User Preferences / Constraints
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline justify-between gap-2">
+          <span
+            className="text-sm font-semibold"
+            style={{ color: warning ? RED : "#374151" }}
+          >
+            {day}
+          </span>
+          {hotel && (
+            <span className="text-[10px] text-gray-400 flex items-center gap-1 flex-shrink-0">
+              <Hotel className="w-3 h-3" />
+              {hotel}
+            </span>
+          )}
+        </div>
+        <div className="flex items-baseline justify-between gap-2 mt-0.5">
+          <span className="text-xs text-gray-400 truncate">{sub}</span>
+          {spend && (
+            <span
+              className="text-xs font-semibold flex-shrink-0"
+              style={{ color: T }}
+            >
+              {spend}
+            </span>
+          )}
+        </div>
       </div>
-      <p className="text-xs italic" style={{ color: "#7A90AA" }}>
-        No extra preferences captured yet.
-      </p>
+      <div className="self-center flex-shrink-0 mt-0.5">
+        {warning ? (
+          <AlertTriangle className="w-4 h-4" style={{ color: RED }} />
+        ) : (
+          <ChevronRight className="w-4 h-4 text-gray-300" />
+        )}
+      </div>
     </div>
   );
 }
@@ -370,6 +757,11 @@ export default function App() {
     condition: "B",
     participantId: "",
     researcher: "",
+    glutenFree: false,
+    accomTier: null,
+    selectedHotel: null,
+    editApplied: false,
+    conflictActive: false,
   });
 
   const updateState = (patch: Partial<S>) =>
@@ -395,6 +787,7 @@ export default function App() {
         ) : (
           <ConditionBScreen
             state={state}
+            updateState={updateState}
             onEndSession={() => setSessionActive(false)}
           />
         )}
@@ -432,7 +825,7 @@ function SetupScreen({
 
   return (
     <div className="h-full flex flex-col" style={{ background: "#F1F3F6" }}>
-      <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between bg-white flex-shrink-0">
+      <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between bg-white flex-shrink-0 shadow-sm z-10">
         <div className="flex items-center gap-2">
           <FlaskConical className="w-5 h-5" style={{ color: T }} />
           <span className="text-sm font-bold text-gray-700">
@@ -535,6 +928,11 @@ function SetupScreen({
                         : "Maieutic Socratic Planner"}
                     </span>
                   </div>
+                  <div className="text-xs text-gray-400 mt-1">
+                    {cond === "A"
+                      ? "Standard prompt-response. Full itinerary generated instantly. No interactive UI or preference capture."
+                      : "AI-guided preference elicitation with dynamic UI, live metrics grid, and conflict resolution protocols."}
+                  </div>
                 </div>
               </label>
             ))}
@@ -570,8 +968,6 @@ function ConditionAScreen({
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-
-  // Telemetry references
   const sessionStartTime = useRef<number>(Date.now());
   const sessionStartStr = useRef<string>(new Date().toISOString());
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -588,35 +984,43 @@ function ConditionAScreen({
       timestamp: getTimestamp(),
       wordCount: countWords(text),
     };
-
     const newHistory = [...messages, userMsg];
     setMessages(newHistory);
     setIsLoading(true);
 
-    const aiResponseText = await callGeminiAPI(newHistory, "A");
+    const aiMsgId = (Date.now() + 1).toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: aiMsgId,
+        text: "",
+        sender: "ai",
+        timestamp: getTimestamp(),
+        wordCount: 0,
+      },
+    ]);
 
-    const aiMsg: Message = {
-      id: (Date.now() + 1).toString(),
-      text: aiResponseText,
-      sender: "ai",
-      timestamp: getTimestamp(),
-      wordCount: countWords(aiResponseText),
-    };
+    await callGeminiAPIStream(newHistory, "A", state, (chunk) => {
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        const newText = last.text + chunk;
+        return [
+          ...prev.slice(0, -1),
+          { ...last, text: newText, wordCount: countWords(newText) },
+        ];
+      });
+    });
 
-    setMessages((prev) => [...prev, aiMsg]);
     setIsLoading(false);
   };
 
   const handleEndSession = () => {
-    const durationSec = Math.round(
-      (Date.now() - sessionStartTime.current) / 1000,
-    );
     generateCSVAndDownload(
       state.participantId,
       state.researcher,
       "A",
       sessionStartStr.current,
-      durationSec,
+      Math.round((Date.now() - sessionStartTime.current) / 1000),
       messages,
     );
     onEndSession();
@@ -625,7 +1029,6 @@ function ConditionAScreen({
   return (
     <div className="h-full flex flex-col bg-white w-1/2 mx-auto border-x border-gray-200 shadow-xl relative">
       <ChatHeader onEndSession={handleEndSession} />
-
       <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col">
         {messages.length === 0 ? (
           <div className="flex-1 flex flex-col items-center justify-center opacity-50">
@@ -637,13 +1040,17 @@ function ConditionAScreen({
             msg.sender === "user" ? (
               <UserBubble key={msg.id}>{msg.text}</UserBubble>
             ) : (
-              <AIBubble key={msg.id}>{msg.text}</AIBubble>
+              <AIBubble
+                key={msg.id}
+                message={msg}
+                state={state}
+                update={() => {}}
+              />
             ),
           )
         )}
         <div ref={messagesEndRef} />
       </div>
-
       <ChatInputBar onSend={handleSendMessage} disabled={isLoading} />
     </div>
   );
@@ -653,9 +1060,11 @@ function ConditionAScreen({
 
 function ConditionBScreen({
   state,
+  updateState,
   onEndSession,
 }: {
   state: S;
+  updateState: (p: Partial<S>) => void;
   onEndSession: () => void;
 }) {
   const [messages, setMessages] = useState<Message[]>([
@@ -669,7 +1078,6 @@ function ConditionBScreen({
   ]);
   const [isLoading, setIsLoading] = useState(false);
 
-  // Telemetry references
   const sessionStartTime = useRef<number>(Date.now());
   const sessionStartStr = useRef<string>(new Date().toISOString());
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -686,76 +1094,101 @@ function ConditionBScreen({
       timestamp: getTimestamp(),
       wordCount: countWords(text),
     };
-
-    // Filter out the "init" placeholder on the first real message
     const filteredPrev = messages.filter((m) => m.id !== "init");
     const newHistory = [...filteredPrev, userMsg];
 
     setMessages(newHistory);
     setIsLoading(true);
 
-    const aiResponseText = await callGeminiAPI(newHistory, "B");
+    const aiMsgId = (Date.now() + 1).toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: aiMsgId,
+        text: "",
+        sender: "ai",
+        timestamp: getTimestamp(),
+        wordCount: 0,
+      },
+    ]);
 
-    const aiMsg: Message = {
-      id: (Date.now() + 1).toString(),
-      text: aiResponseText,
-      sender: "ai",
-      timestamp: getTimestamp(),
-      wordCount: countWords(aiResponseText),
-    };
+    await callGeminiAPIStream(newHistory, "B", state, (chunk) => {
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        const newText = last.text + chunk;
 
-    setMessages((prev) => [...prev, aiMsg]);
+        // Simulating passive state extraction: if AI mentions gluten-free, toggle it.
+        if (
+          newText.toLowerCase().includes("gluten-free") &&
+          !state.glutenFree
+        ) {
+          updateState({ glutenFree: true });
+        }
+
+        return [
+          ...prev.slice(0, -1),
+          { ...last, text: newText, wordCount: countWords(newText) },
+        ];
+      });
+    });
+
     setIsLoading(false);
   };
 
   const handleEndSession = () => {
-    const durationSec = Math.round(
-      (Date.now() - sessionStartTime.current) / 1000,
-    );
-    // Ignore the init message in the final export
     const exportMessages = messages.filter((m) => m.id !== "init");
     generateCSVAndDownload(
       state.participantId,
       state.researcher,
       "B",
       sessionStartStr.current,
-      durationSec,
+      Math.round((Date.now() - sessionStartTime.current) / 1000),
       exportMessages,
     );
     onEndSession();
   };
 
+  // Derive tags for Preference section based on state
+  const activeTags = [];
+  if (state.glutenFree) activeTags.push("Gluten-free");
+  if (state.accomTier) activeTags.push(state.accomTier);
+
   return (
     <div className="h-full flex w-full">
-      <div className="w-1/3 flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10 relative">
+      <div className="w-[400px] flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10 relative">
         <ChatHeader onEndSession={handleEndSession} />
 
         <div className="flex-1 flex flex-col overflow-y-auto px-5 pt-4 pb-2">
           {messages.map((msg) => {
-            if (msg.sender === "user") {
+            if (msg.sender === "user")
               return <UserBubble key={msg.id}>{msg.text}</UserBubble>;
-            } else {
-              if (msg.id === "init") {
-                return (
+            if (msg.id === "init") {
+              return (
+                <div
+                  key={msg.id}
+                  className="w-full rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 flex flex-col items-center gap-3 mb-4 mt-auto"
+                  style={{ background: "#FAFAFA" }}
+                >
                   <div
-                    key={msg.id}
-                    className="w-full rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 flex flex-col items-center gap-3 mb-4"
-                    style={{ background: "#FAFAFA" }}
+                    className="w-12 h-12 rounded-full flex items-center justify-center"
+                    style={{ background: T_LIGHT }}
                   >
-                    <div
-                      className="w-12 h-12 rounded-full flex items-center justify-center"
-                      style={{ background: T_LIGHT }}
-                    >
-                      <Sparkles className="w-6 h-6" style={{ color: T }} />
-                    </div>
-                    <p className="text-sm text-gray-400 text-center leading-relaxed">
-                      {msg.text}
-                    </p>
+                    <Sparkles className="w-6 h-6" style={{ color: T }} />
                   </div>
-                );
-              }
-              return <AIBubble key={msg.id}>{msg.text}</AIBubble>;
+                  <p className="text-sm text-gray-400 text-center leading-relaxed">
+                    {msg.text}
+                  </p>
+                </div>
+              );
             }
+            return (
+              <AIBubble
+                key={msg.id}
+                message={msg}
+                state={state}
+                update={updateState}
+              />
+            );
           })}
           <div ref={messagesEndRef} />
         </div>
@@ -764,24 +1197,80 @@ function ConditionBScreen({
       </div>
 
       <div className="flex-1 flex flex-col" style={{ background: "#F8FAFC" }}>
-        <MetricsGrid />
+        <MetricsGrid state={state} />
 
-        <div className="flex-1 flex items-center justify-center px-8 relative overflow-y-auto">
-          <div className="text-center max-w-sm">
-            <div
-              className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
-              style={{ background: T_LIGHT }}
-            >
-              <CalendarDays className="w-7 h-7" style={{ color: T }} />
+        <div className="flex-1 px-8 py-6 relative overflow-y-auto">
+          {messages.length <= 1 ? (
+            <div className="h-full flex flex-col items-center justify-center text-center max-w-sm mx-auto opacity-60">
+              <div
+                className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
+                style={{ background: T_LIGHT }}
+              >
+                <CalendarDays className="w-7 h-7" style={{ color: T }} />
+              </div>
+              <p className="text-sm text-gray-400 leading-relaxed">
+                Your AI-generated itinerary and live tracking metrics will
+                appear here once you start the conversation.
+              </p>
             </div>
-            <p className="text-sm text-gray-400 leading-relaxed">
-              Your AI-generated itinerary and live tracking metrics will appear
-              here once you start the conversation.
-            </p>
-          </div>
+          ) : (
+            <div className="max-w-2xl mx-auto space-y-4 pb-12">
+              <div className="text-[10px] font-bold tracking-widest uppercase text-gray-400 mb-2">
+                High-Level Itinerary Artifact
+              </div>
+              <DayCardCollapsed
+                day="Day 1 – Zurich"
+                sub="Arrival – Old Town"
+                hotel={state.accomTier ? "Hotel Adler" : undefined}
+              />
+              {state.accomTier && (
+                <DayCardCollapsed
+                  day="Day 2 – Paris"
+                  sub="Eiffel Tower – Louvre"
+                  hotel={state.accomTier ? "Hôtel Grands Hommes" : undefined}
+                  spend="145 CHF"
+                />
+              )}
+              {state.conflictActive && (
+                <DayCardCollapsed
+                  day="Day 3 – Alpine Tour ⚠️"
+                  sub="Helicopter Tour – OVER BUDGET"
+                  warning
+                />
+              )}
+            </div>
+          )}
         </div>
 
-        <PreferencesSection />
+        <div
+          className="flex-shrink-0 border-t border-gray-200 px-6 py-3"
+          style={{ background: PREFS_BG }}
+        >
+          <div
+            className="text-[9px] font-bold tracking-widest uppercase mb-1.5"
+            style={{ color: "#5A7090" }}
+          >
+            Active Constraints
+          </div>
+          {activeTags.length === 0 ? (
+            <p className="text-xs italic" style={{ color: "#7A90AA" }}>
+              No preferences captured yet.
+            </p>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {activeTags.map((tag) => (
+                <span
+                  key={tag}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+                  style={{ background: T }}
+                >
+                  <Check className="w-3 h-3" />
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
