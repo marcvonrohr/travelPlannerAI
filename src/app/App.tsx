@@ -1,3 +1,4 @@
+// @ts-ignore
 import React, { useState, KeyboardEvent, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import {
@@ -18,43 +19,45 @@ import {
   Play,
   Hotel,
   XCircle,
+  Map,
 } from "lucide-react";
 
 // --- Configuration ---
 export const GEMINI_MODEL =
-  import.meta.env.VITE_GEMINI_MODEL || "gemini-2.5-pro";
+  import.meta.env.VITE_GEMINI_MODEL || "gemini-3.0-pro";
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 
-// --- System Prompts & Context (The "Brain" of our Generative UI) ---
+// --- System Prompts & Context Engine ---
 const SYSTEM_PROMPT_A = `You are a highly efficient and directive travel assistant.
 Your goal is to provide complete, detailed travel itineraries immediately based on the user's request.
-Give the user exactly what they ask for in a structured, comprehensive markdown format. Do not ask endless follow-up questions. Provide the full plan quickly.
+Give the user exactly what they ask for in a structured, comprehensive markdown format. Do not ask follow-up questions. Provide the full plan quickly.
 Reply in English.`;
 
-const SYSTEM_PROMPT_B = `You are a maieutic, Socratic travel planner powered by Augmented Intelligence.
-Your goal is to extract the user's constraints (budget, destination, dates, dietary) step by step, and then propose a highly adaptable itinerary.
+const SYSTEM_PROMPT_B = `You are a maieutic, Socratic travel planner.
+Your goal is to extract the user's constraints (budget, destination, dates, dietary) step by step, and propose an adaptable itinerary.
 
 CRITICAL RULES FOR SOCRATIC MODE:
-1. Don't ask endless questions. Ask 1-2 questions to get the basics (Destination, Budget, Duration, Group), then PROPOSE a high-level plan.
-2. Once you propose a plan, allow the user to adjust specific days or budgets.
-3. OPENUI GENERATION: You have the ability to render interactive UI widgets directly in the chat. To do this, output the exact tags below on a new line. 
-   - When suggesting hotel tiers, output: <UI_HOTEL_SELECTION />
-   - When the user asks for an expensive adjustment that exceeds the budget (e.g., an Alpine Helicopter Tour), YOU MUST WARN THEM and output: <UI_CONFLICT />
-   - When suggesting quick edits to a specific day, output: <UI_SUGGESTION_CHIPS />
-4. STATE UPDATES: If the user confirms a preference (e.g., "Gluten-free" or "1500 CHF"), you must acknowledge it. The UI will extract it automatically.
-Reply in English. Keep text concise when using UI tags.`;
+1. Ask 1-2 questions to get basics (Destination, Budget, Duration), then PROPOSE a high-level plan.
+2. OPENUI GENERATION: You MUST output structured data to drive the UI. Do this by appending a Markdown code block with the language "oui" containing specific tags.
+3. ALWAYS include a State Update tag in every response to keep the UI in sync:
+   \`\`\`oui
+   <UI_StateUpdate cost="number" prefs="number" days="number" plan='[{"day":1,"title":"...","activities":[{"time":"...","name":"...","note":"..."}]}]' />
+   \`\`\`
+4. When suggesting hotels, add: \`\`\`oui <UI_HotelSelection options='[{"tier":"Budget","price":"80 CHF"},{"tier":"3-Star","price":"150 CHF"}]' /> \`\`\`
+5. When the user requests something exceeding the budget (e.g. Helicopter), add: \`\`\`oui <UI_Conflict issue="Budget exceeded by 150 CHF" /> \`\`\`
+6. Acknowledge user choices in text, but let the OUI tags drive the dashboard.
+Reply in English. Keep text concise.`;
 
 const getTravelContextString = (condition: "A" | "B", state: S) => {
   if (condition === "A")
     return "Context: No active constraints tracked in baseline.";
   return `CURRENT CONTEXT & KNOWN CONSTRAINTS:
-- Gluten-free requested: ${state.glutenFree ? "Yes" : "No"}
-- Accommodation Tier: ${state.accomTier || "Pending"}
-- Budget Status: ${state.conflictActive ? "OVER BUDGET" : "Within limits"}
+- Edit Focus: ${state.focusDay !== null ? `User is editing Day ${state.focusDay}` : "None"}
+- Known Preferences: ${state.tags.join(", ") || "None yet"}
 Use this context to guide your response.`;
 };
 
-// --- Design tokens (From Figma) ---
+// --- Design tokens ---
 const T = "#0B7A75";
 const T_LIGHT = "#EDF7F6";
 const T_BORDER = "#A7D9D6";
@@ -74,38 +77,46 @@ const METRIC_CARD = "#F2F5FA";
 const METRIC_BORDER = "#BEC9DA";
 const PREFS_BG = "#DDE5F0";
 
-// --- Shared Types ---
+// --- Types ---
+type Activity = { time: string; name: string; note: string; changed?: boolean };
+type DayPlan = {
+  day: number;
+  title: string;
+  hotel?: string;
+  spend?: string;
+  warning?: boolean;
+  activities: Activity[];
+};
+
 interface S {
   condition: "A" | "B";
   participantId: string;
   researcher: string;
-  glutenFree: boolean;
-  accomTier: string | null;
-  selectedHotel: string | null;
-  editApplied: boolean;
-  conflictActive: boolean;
+  metrics: { cost: string; prefs: string; days: string };
+  tags: string[];
+  plan: DayPlan[];
+  focusDay: number | null;
 }
 
 export type Message = {
   id: string;
-  text: string;
+  text: string; // Raw text
+  ouiCode?: string; // Extracted OpenUI Code
   sender: "user" | "ai";
   timestamp: string;
   wordCount: number;
 };
 
-// --- Helper Functions ---
+// --- Helpers & CSV Export ---
 const countWords = (str: string) =>
   str
     .trim()
     .split(/\s+/)
-    .filter((word) => word.length > 0).length;
+    .filter((w) => w.length > 0).length;
 const getTimestamp = () => new Date().toISOString();
 
 const generateCSVAndDownload = (
-  participantId: string,
-  researcher: string,
-  condition: string,
+  state: S,
   sessionStartStr: string,
   durationSec: number,
   messages: Message[],
@@ -117,9 +128,9 @@ const generateCSVAndDownload = (
 
   messages.forEach((msg) => {
     const row = [
-      escapeCSV(participantId),
-      escapeCSV(researcher),
-      condition,
+      escapeCSV(state.participantId),
+      escapeCSV(state.researcher),
+      state.condition,
       sessionStartStr,
       durationSec,
       userTurns,
@@ -133,16 +144,28 @@ const generateCSVAndDownload = (
   });
 
   const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.setAttribute("href", url);
+  link.setAttribute("href", URL.createObjectURL(blob));
   link.setAttribute(
     "download",
-    `VoyagerLab_Log_${participantId}_Cond${condition}_${Date.now()}.csv`,
+    `VoyagerLab_Log_${state.participantId}_Cond${state.condition}_${Date.now()}.csv`,
   );
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+};
+
+// --- OpenUI Parser ---
+const parseMessageContent = (rawText: string) => {
+  const ouiRegex = /```oui\n([\s\S]*?)\n```/;
+  const match = rawText.match(ouiRegex);
+  if (match) {
+    return {
+      text: rawText.replace(match[0], "").trim(),
+      ouiCode: match[1].trim(),
+    };
+  }
+  return { text: rawText, ouiCode: undefined };
 };
 
 // --- Streaming API Call with Auto-Retry ---
@@ -154,80 +177,60 @@ const callGeminiAPIStream = async (
   state: S,
   onChunk: (chunk: string) => void,
 ) => {
-  if (!GEMINI_API_KEY) {
-    onChunk(
-      "API Key is missing. Please set VITE_GEMINI_API_KEY in your .env.local file.",
-    );
-    return;
-  }
-
+  if (!GEMINI_API_KEY)
+    return onChunk("API Key is missing. Set VITE_GEMINI_API_KEY.");
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
-  const systemInstruction =
-    condition === "A" ? SYSTEM_PROMPT_A : SYSTEM_PROMPT_B;
-  const fullSystemPrompt = `${systemInstruction}\n\n${getTravelContextString(condition, state)}`;
+  const fullSystemPrompt = `${condition === "A" ? SYSTEM_PROMPT_A : SYSTEM_PROMPT_B}\n\n${getTravelContextString(condition, state)}`;
 
   const contents = chatHistory
-    .filter((msg) => msg.id !== "init")
-    .map((msg) => ({
-      role: msg.sender === "user" ? "user" : "model",
-      parts: [{ text: msg.text }],
+    .filter((m) => m.id !== "init")
+    .map((m) => ({
+      role: m.sender === "user" ? "user" : "model",
+      parts: [
+        {
+          text: m.text + (m.ouiCode ? `\n\`\`\`oui\n${m.ouiCode}\n\`\`\`` : ""),
+        },
+      ],
     }));
 
-  const payload = {
-    system_instruction: { parts: [{ text: fullSystemPrompt }] },
-    contents: contents,
-  };
-
-  let retries = 3;
-  let delay = 1000;
-
+  let retries = 3,
+    delay = 1500;
   while (retries > 0) {
     try {
-      const response = await fetch(url, {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: fullSystemPrompt }] },
+          contents,
+        }),
       });
-
-      if (response.status === 503) {
-        throw new Error("503");
-      }
-
-      if (!response.body) throw new Error("No response body");
-
-      const reader = response.body.getReader();
+      if (res.status === 503) throw new Error("503");
+      if (!res.body) throw new Error("No body");
+      const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
-
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n");
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const dataStr = line.slice(6);
-            if (dataStr === "[DONE]") continue;
+        chunk.split("\n").forEach((line) => {
+          if (line.startsWith("data: ") && line !== "data: [DONE]") {
             try {
-              const data = JSON.parse(dataStr);
-              if (data.candidates && data.candidates[0].content.parts[0].text) {
-                onChunk(data.candidates[0].content.parts[0].text);
-              }
-            } catch (e) {
-              /* Ignore broken json chunks in stream */
-            }
+              onChunk(
+                JSON.parse(line.slice(6)).candidates[0].content.parts[0].text,
+              );
+            } catch (e) {}
           }
-        }
+        });
       }
-      return; // Success, exit retry loop
-    } catch (error: any) {
-      if (error.message === "503" && retries > 1) {
+      return;
+    } catch (err: any) {
+      if (err.message === "503" && retries > 1) {
         retries--;
         await sleep(delay);
-        delay *= 2; // Exponential backoff
-      } else {
-        onChunk("\n*[Network Error: Please try again]*");
-        return;
-      }
+        delay *= 2;
+      } else
+        return onChunk("\n*[System: High demand. Attempting to reconnect...]*");
     }
   }
 };
@@ -258,94 +261,158 @@ function ChatHeader({ onEndSession }: { onEndSession?: () => void }) {
   );
 }
 
-// ─── OpenUI Renderer (The Generative UI Magic) ───────────────────────────────
-// This function parses the AI text and replaces OpenUI tags with actual React components
-const renderMessageWithOpenUI = (
-  text: string,
-  state: S,
-  update: (patch: Partial<S>) => void,
-) => {
-  const parts = text.split(/(<UI_[A-Z_]+\s*\/>)/g);
-
-  return parts.map((part, index) => {
-    if (part.includes("<UI_HOTEL_SELECTION />")) {
-      return (
-        <div key={index} className="my-4">
-          <AccommodationTier
-            selected={state.accomTier}
-            onSelect={(t) => update({ accomTier: t })}
-          />
-        </div>
-      );
-    }
-    if (part.includes("<UI_CONFLICT />")) {
-      // Auto-trigger conflict state if AI decides there's a conflict
-      if (!state.conflictActive)
-        setTimeout(() => update({ conflictActive: true }), 0);
-      return <ConflictResolutionWidget key={index} />;
-    }
-    if (part.includes("<UI_SUGGESTION_CHIPS />")) {
-      return (
-        <SuggestionChips
-          key={index}
-          chips={[
-            "Replace Louvre visit",
-            "Adjust meal times",
-            "Find GF breakfast",
-          ]}
-        />
-      );
-    }
-    // Default: Render Markdown for regular text
-    return (
-      <div key={index} className="prose prose-sm prose-slate max-w-none">
-        <ReactMarkdown>{part}</ReactMarkdown>
-      </div>
+// --- OpenUI React Engine ---
+// Parses XML-like strings extracted from Gemini's .oui code blocks
+function OpenUIRenderer({
+  code,
+  onAction,
+  updateState,
+}: {
+  code: string;
+  onAction: (msg: string) => void;
+  updateState: (p: Partial<S>) => void;
+}) {
+  // Silent State Updater
+  useEffect(() => {
+    const stateMatch = code.match(
+      /<UI_StateUpdate\s+cost="([^"]*)"\s+prefs="([^"]*)"\s+days="([^"]*)"\s+plan='([^']*)'\s*\/>/,
     );
-  });
-};
+    if (stateMatch) {
+      try {
+        updateState({
+          metrics: {
+            cost: stateMatch[1],
+            prefs: stateMatch[2],
+            days: stateMatch[3],
+          },
+          plan: JSON.parse(stateMatch[4]),
+        });
+      } catch (e) {
+        console.error("OUI JSON Parse error", e);
+      }
+    }
+  }, [code, updateState]);
 
-function AIBubble({
+  const components = [];
+
+  if (code.includes("<UI_HotelSelection")) {
+    components.push(
+      <div
+        key="hotel"
+        className="mt-2 w-full p-4 border border-dashed rounded-xl bg-white"
+        style={{ borderColor: T_BORDER }}
+      >
+        <h4 className="text-xs font-bold uppercase mb-3 text-gray-500 flex items-center gap-1">
+          <Zap size={12} color={T} /> Accommodation Options
+        </h4>
+        <div className="flex gap-2">
+          {["Budget", "3-Star", "Luxury"].map((tier) => (
+            <button
+              key={tier}
+              onClick={() => onAction(`I select the ${tier} option.`)}
+              className="flex-1 py-2 text-xs font-medium border rounded-lg hover:bg-slate-50 transition-colors"
+              style={{ color: T, borderColor: T_BORDER }}
+            >
+              {tier}
+            </button>
+          ))}
+        </div>
+      </div>,
+    );
+  }
+
+  if (code.includes("<UI_Conflict")) {
+    components.push(
+      <div
+        key="conflict"
+        className="mt-2 w-full p-4 rounded-xl border"
+        style={{ background: AMBER_LIGHT, borderColor: AMBER_BORDER }}
+      >
+        <div className="flex items-center gap-2 mb-3">
+          <AlertTriangle className="w-4 h-4" style={{ color: AMBER }} />
+          <span className="text-xs font-bold" style={{ color: AMBER }}>
+            Constraint Conflict Detected
+          </span>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => onAction("Increase my budget limit.")}
+            className="px-3 py-2 text-xs font-bold text-white rounded-lg transition-transform hover:scale-105"
+            style={{ background: AMBER }}
+          >
+            Increase Budget
+          </button>
+          <button
+            onClick={() => onAction("Swap the expensive activity.")}
+            className="px-3 py-2 text-xs font-bold text-white rounded-lg transition-transform hover:scale-105"
+            style={{ background: T }}
+          >
+            Swap Activity
+          </button>
+        </div>
+      </div>,
+    );
+  }
+
+  return <>{components}</>;
+}
+
+function ChatMessageRow({
   message,
   state,
-  update,
+  onAction,
+  updateState,
 }: {
   message: Message;
   state: S;
-  update: (p: Partial<S>) => void;
+  onAction: (m: string) => void;
+  updateState: (p: Partial<S>) => void;
 }) {
-  return (
-    <div className="flex gap-2.5 mb-3">
-      <div
-        className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center mt-0.5"
-        style={{ background: T }}
-      >
-        <Sparkles className="w-3.5 h-3.5 text-white" />
+  if (message.sender === "user") {
+    return (
+      <div className="flex justify-end items-end gap-2 mb-4">
+        <div
+          className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap shadow-sm"
+          style={{ background: T, color: "white", maxWidth: "80%" }}
+        >
+          {message.text}
+        </div>
       </div>
-      <div
-        className="rounded-2xl rounded-tl-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap overflow-hidden"
-        style={{
-          background: BUBBLE_BG,
-          border: `1px solid ${BUBBLE_BORDER}`,
-          color: "#374151",
-          maxWidth: "85%",
-        }}
-      >
-        {renderMessageWithOpenUI(message.text, state, update)}
-      </div>
-    </div>
-  );
-}
+    );
+  }
 
-function UserBubble({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex justify-end items-end gap-2 mb-3">
-      <div
-        className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap"
-        style={{ background: T, color: "white", maxWidth: "80%" }}
-      >
-        {children}
+    <div className="flex flex-col mb-5 w-full">
+      <div className="flex gap-2.5">
+        <div
+          className="w-7 h-7 rounded-full flex-shrink-0 flex items-center justify-center mt-0.5 shadow-sm"
+          style={{ background: T }}
+        >
+          <Sparkles className="w-3.5 h-3.5 text-white" />
+        </div>
+        <div
+          className="rounded-2xl rounded-tl-none px-5 py-3 text-sm leading-relaxed shadow-sm w-full"
+          style={{
+            background: BUBBLE_BG,
+            border: `1px solid ${BUBBLE_BORDER}`,
+            color: "#374151",
+          }}
+        >
+          <div className="prose prose-sm prose-slate max-w-none">
+            <ReactMarkdown>{message.text}</ReactMarkdown>
+          </div>
+        </div>
       </div>
+      {/* OUI Components render strictly AFTER the bubble */}
+      {message.ouiCode && (
+        <div className="ml-9 mt-1 max-w-[85%]">
+          <OpenUIRenderer
+            code={message.ouiCode}
+            onAction={onAction}
+            updateState={updateState}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -364,27 +431,11 @@ function ChatInputBar({
     if (text.trim() === "" || disabled) return;
     onSend(text);
     setText("");
-    if (textareaRef.current) textareaRef.current.style.height = "auto"; // reset height
-  };
-
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setText(e.target.value);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      // Max height approx 3 lines (e.g. 72px)
-      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 72)}px`;
-    }
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
   };
 
   return (
-    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white z-10 relative">
+    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white z-10 relative shadow-sm">
       <div
         className="flex items-end gap-2.5 rounded-xl px-4 py-2.5 border transition-opacity"
         style={{
@@ -396,8 +447,19 @@ function ChatInputBar({
         <textarea
           ref={textareaRef}
           value={text}
-          onChange={handleInput}
-          onKeyDown={handleKeyDown}
+          onChange={(e) => {
+            setText(e.target.value);
+            if (textareaRef.current) {
+              textareaRef.current.style.height = "auto";
+              textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 72)}px`;
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              handleSend();
+            }
+          }}
           disabled={disabled}
           placeholder={
             disabled
@@ -411,7 +473,7 @@ function ChatInputBar({
         <button
           onClick={handleSend}
           disabled={disabled || text.trim() === ""}
-          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer disabled:pointer-events-none mb-0.5"
+          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 mb-0.5 disabled:pointer-events-none"
           style={{ background: disabled || text.trim() === "" ? "#9CA3AF" : T }}
         >
           <ArrowRight className="w-4 h-4 text-white" />
@@ -421,220 +483,26 @@ function ChatInputBar({
   );
 }
 
-// ─── OpenUI Widget Components (from Figma) ───────────────────────────────────
+// ─── Artifacts & Right Panel ───────────────────────────────────────────────────
 
-function AIMicroFrontend({
-  children,
-  label = "Quick Preferences",
-}: {
-  children: React.ReactNode;
-  label?: string;
-}) {
-  return (
-    <div
-      className="mt-2 mb-1 rounded-xl overflow-hidden flex-shrink-0"
-      style={{ border: `1.5px dashed ${T_BORDER}`, background: "#FAFFFE" }}
-    >
-      <div
-        className="px-3.5 py-1.5 flex items-center justify-between border-b"
-        style={{ borderColor: T_BORDER, background: T_LIGHT }}
-      >
-        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
-          {label}
-        </span>
-        <div className="flex items-center gap-1" style={{ color: T }}>
-          <Zap className="w-3 h-3" />
-          <span className="text-[9px] font-bold tracking-widest uppercase">
-            AI-generated
-          </span>
-        </div>
-      </div>
-      <div className="px-3.5 py-3">{children}</div>
-    </div>
-  );
-}
-
-function AccommodationTier({
-  selected,
-  onSelect,
-}: {
-  selected: string | null;
-  onSelect: (t: string) => void;
-}) {
-  const tiers = ["Hostel", "3-Star", "Luxury"];
-  const pos =
-    selected === "Hostel" ? "15%" : selected === "Luxury" ? "85%" : "50%";
-
-  return (
-    <AIMicroFrontend label="Hotel Selection">
-      <div className="flex gap-1 mb-2.5">
-        {tiers.map((t) => (
-          <button
-            key={t}
-            onClick={() => onSelect(t)}
-            className="flex-1 py-1 rounded-lg text-xs font-medium border transition-all"
-            style={
-              t === selected
-                ? { background: T, color: "white", borderColor: T }
-                : {
-                    background: "white",
-                    color: "#6B7280",
-                    borderColor: "#E5E7EB",
-                  }
-            }
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-      <div className="relative h-1.5 bg-gray-200 rounded-full">
-        <div
-          className="h-1.5 rounded-full transition-all duration-300"
-          style={{ width: pos, background: T }}
-        />
-        <div
-          className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3.5 h-3.5 rounded-full bg-white border-2 shadow-sm transition-all duration-300"
-          style={{ left: pos, borderColor: T }}
-        />
-      </div>
-    </AIMicroFrontend>
-  );
-}
-
-function SuggestionChips({ chips }: { chips: string[] }) {
-  const [active, setActive] = useState<string | null>(null);
-  return (
-    <AIMicroFrontend label="Suggested Edits">
-      <div className="flex flex-wrap gap-2">
-        {chips.map((c) => (
-          <button
-            key={c}
-            onClick={() => setActive((a) => (a === c ? null : c))}
-            className="px-3 py-1.5 rounded-full text-xs font-medium border transition-all"
-            style={
-              active === c
-                ? { background: T, color: "white", borderColor: T }
-                : { background: "white", color: T, borderColor: T_BORDER }
-            }
-          >
-            {c}
-          </button>
-        ))}
-      </div>
-    </AIMicroFrontend>
-  );
-}
-
-function ConflictResolutionWidget() {
-  const [chosen, setChosen] = useState<string | null>(null);
-  return (
-    <AIMicroFrontend label="Budget Conflict">
-      <div
-        className="flex items-center gap-2 rounded-xl px-3 py-2 mb-3"
-        style={{ background: AMBER_LIGHT, border: `1px solid ${AMBER_BORDER}` }}
-      >
-        <AlertTriangle
-          className="w-4 h-4 flex-shrink-0"
-          style={{ color: AMBER }}
-        />
-        <span className="text-xs font-bold" style={{ color: AMBER }}>
-          Budget Conflict Detected
-        </span>
-        <span
-          className="ml-auto text-[10px] font-bold"
-          style={{ color: AMBER }}
-        >
-          +150 CHF over limit
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {["Increase budget limit", "Swap an existing activity"].map((c) => (
-          <button
-            key={c}
-            onClick={() => setChosen((ch) => (ch === c ? null : c))}
-            className="px-3 py-1.5 rounded-full text-xs font-medium border transition-all"
-            style={
-              chosen === c
-                ? {
-                    background: c.includes("Increase") ? AMBER : T,
-                    color: "white",
-                    borderColor: c.includes("Increase") ? AMBER : T,
-                  }
-                : {
-                    background: "white",
-                    color: c.includes("Increase") ? AMBER : T,
-                    borderColor: c.includes("Increase")
-                      ? AMBER_BORDER
-                      : T_BORDER,
-                  }
-            }
-          >
-            {c}
-          </button>
-        ))}
-      </div>
-    </AIMicroFrontend>
-  );
-}
-
-// ─── Right Panel Components (Condition B) ──────────────────────────────────────
-
-type MC = {
-  label: string;
-  value: string;
-  sub: string;
-  icon: React.ReactNode;
-  green?: boolean;
-  red?: boolean;
-};
-function MetricsGrid({ state }: { state: S }) {
-  const I_N = <span className="text-[10px] text-gray-300">CHF</span>;
-  const I_G = (
-    <span className="text-[10px]" style={{ color: GREEN }}>
-      CHF
-    </span>
-  );
-  const I_R = <AlertTriangle className="w-3.5 h-3.5" style={{ color: RED }} />;
-  const I_BT = <BadgeCheck className="w-3.5 h-3.5" style={{ color: T }} />;
-  const I_C = <CalendarDays className="w-3.5 h-3.5 text-gray-400" />;
-
-  // Dynamically calculate metrics based on state
-  let cost = "0";
-  let costSub = "awaiting input";
-  let costIcon = I_N;
-  let costRed = false;
-  let costGreen = false;
-  let prefs = "0";
-  let prefsSub = "none captured";
-  let days = "0";
-  let daysSub = "route pending";
-
-  // Simulate parsing the conversation state into metrics
-  if (state.accomTier || state.glutenFree) {
-    cost = state.conflictActive ? "1,650" : "1,329";
-    costSub = state.conflictActive ? "150 over limit!" : "171 under budget";
-    costIcon = state.conflictActive ? I_R : I_G;
-    costRed = state.conflictActive;
-    costGreen = !state.conflictActive;
-    prefs = (state.accomTier ? 1 : 0) + (state.glutenFree ? 1 : 0) + "";
-    prefsSub = "captured";
-    days = "7";
-    daysSub = "Europe route";
-  }
-
-  const metrics: MC[] = [
+function MetricsGrid({ metrics }: { metrics: S["metrics"] }) {
+  const mData = [
     {
       label: "Est. Cost",
-      value: cost,
-      sub: costSub,
-      icon: costIcon,
-      red: costRed,
-      green: costGreen,
+      value: metrics.cost,
+      icon: <span className="text-[10px] text-gray-400">CHF</span>,
     },
-    { label: "Satisfied Prefs", value: prefs, sub: prefsSub, icon: I_BT },
-    { label: "Days Planned", value: days, sub: daysSub, icon: I_C },
+    {
+      label: "Satisfied Prefs",
+      value: metrics.prefs,
+      icon: <BadgeCheck className="w-3.5 h-3.5 text-gray-400" />,
+    },
+    {
+      label: "Days Planned",
+      value: metrics.days,
+      icon: <CalendarDays className="w-3.5 h-3.5 text-gray-400" />,
+    },
   ];
-
   return (
     <div
       className="border-b border-gray-200 flex-shrink-0"
@@ -651,17 +519,11 @@ function MetricsGrid({ state }: { state: S }) {
           </span>
         </div>
         <div className="grid grid-cols-3 gap-3">
-          {metrics.map((m) => (
+          {mData.map((m) => (
             <div
               key={m.label}
-              className="rounded-2xl px-4 py-3 border transition-colors"
-              style={
-                m.red
-                  ? { background: RED_LIGHT, borderColor: RED_BORDER }
-                  : m.green
-                    ? { background: GREEN_LIGHT, borderColor: GREEN_BORDER }
-                    : { background: METRIC_CARD, borderColor: METRIC_BORDER }
-              }
+              className="rounded-2xl px-4 py-3 border bg-white"
+              style={{ borderColor: METRIC_BORDER }}
             >
               <div className="flex items-center gap-1.5 mb-1">
                 {m.icon}
@@ -669,17 +531,8 @@ function MetricsGrid({ state }: { state: S }) {
                   {m.label}
                 </span>
               </div>
-              <div
-                className="text-2xl font-bold leading-none"
-                style={{ color: m.red ? RED : m.green ? GREEN : "#1A1D23" }}
-              >
+              <div className="text-2xl font-bold leading-none text-slate-800">
                 {m.value}
-              </div>
-              <div
-                className="text-[10px] mt-1 truncate"
-                style={{ color: m.red ? RED : m.green ? GREEN : "#9CA3AF" }}
-              >
-                {m.sub}
               </div>
             </div>
           ))}
@@ -689,67 +542,105 @@ function MetricsGrid({ state }: { state: S }) {
   );
 }
 
-function DayCardCollapsed({
-  day,
-  sub,
-  hotel,
-  spend,
-  warning = false,
+function ItineraryArtifact({
+  plan,
+  focusDay,
+  onSetFocus,
 }: {
-  day: string;
-  sub: string;
-  hotel?: string;
-  spend?: string;
-  warning?: boolean;
+  plan: DayPlan[];
+  focusDay: number | null;
+  onSetFocus: (d: number) => void;
 }) {
+  const [expanded, setExpanded] = useState<number | null>(null);
+
+  if (!plan || plan.length === 0)
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-center opacity-60">
+        <div
+          className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
+          style={{ background: T_LIGHT }}
+        >
+          <Map className="w-7 h-7" style={{ color: T }} />
+        </div>
+        <p className="text-sm text-gray-400 max-w-xs">
+          Your AI-generated itinerary artifacts will appear here once proposed.
+        </p>
+      </div>
+    );
+
   return (
-    <div
-      className="border rounded-2xl px-4 py-3 flex items-start gap-2 transition-colors hover:opacity-90 shadow-sm"
-      style={
-        warning
-          ? { borderColor: RED_BORDER, background: RED_LIGHT }
-          : { borderColor: "#E2E8F0", background: "#FAFCFF" }
-      }
-    >
-      <div className="flex-1 min-w-0">
-        <div className="flex items-baseline justify-between gap-2">
-          <span
-            className="text-sm font-semibold"
-            style={{ color: warning ? RED : "#374151" }}
+    <div className="max-w-2xl mx-auto w-full space-y-4 pb-12 pt-6">
+      <div className="text-[10px] font-bold tracking-widest uppercase text-gray-400 mb-2">
+        High-Level Itinerary Artifact
+      </div>
+      {plan.map((d) => (
+        <div
+          key={d.day}
+          className="rounded-2xl overflow-hidden shadow-sm transition-all"
+          style={{ border: `2px solid ${focusDay === d.day ? T : "#E2E8F0"}` }}
+        >
+          <div
+            className="px-4 py-3 flex items-center justify-between cursor-pointer bg-white hover:bg-slate-50"
+            onClick={() => setExpanded(expanded === d.day ? null : d.day)}
           >
-            {day}
-          </span>
-          {hotel && (
-            <span className="text-[10px] text-gray-400 flex items-center gap-1 flex-shrink-0">
-              <Hotel className="w-3 h-3" />
-              {hotel}
-            </span>
+            <div>
+              <div
+                className="text-sm font-semibold"
+                style={{ color: focusDay === d.day ? T : "#374151" }}
+              >
+                Day {d.day} – {d.title}
+              </div>
+              <div className="text-xs text-gray-400 mt-0.5">
+                {d.activities?.length || 0} activities{" "}
+                {d.hotel ? `• Stay: ${d.hotel}` : ""}
+              </div>
+            </div>
+            {expanded === d.day ? (
+              <ChevronDown className="w-4 h-4 text-slate-400" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-slate-400" />
+            )}
+          </div>
+          {expanded === d.day && (
+            <div className="bg-slate-50 px-4 py-3 border-t border-slate-100">
+              <div className="space-y-2 mb-3">
+                {d.activities?.map((a, i) => (
+                  <div
+                    key={i}
+                    className="flex items-start gap-3 rounded-xl px-2 py-1"
+                  >
+                    <span className="text-[10px] font-mono text-gray-400 w-11 mt-0.5">
+                      {a.time}
+                    </span>
+                    <span className="flex-1 text-sm text-slate-700">
+                      {a.name}
+                    </span>
+                    <span className="text-xs text-gray-400">{a.note}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-end pt-2">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSetFocus(d.day);
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border shadow-sm transition-colors hover:bg-slate-100"
+                  style={{ color: T, borderColor: T_BORDER }}
+                >
+                  <Pencil className="w-3 h-3" />{" "}
+                  {focusDay === d.day ? "Currently Editing" : "Edit this day"}
+                </button>
+              </div>
+            </div>
           )}
         </div>
-        <div className="flex items-baseline justify-between gap-2 mt-0.5">
-          <span className="text-xs text-gray-400 truncate">{sub}</span>
-          {spend && (
-            <span
-              className="text-xs font-semibold flex-shrink-0"
-              style={{ color: T }}
-            >
-              {spend}
-            </span>
-          )}
-        </div>
-      </div>
-      <div className="self-center flex-shrink-0 mt-0.5">
-        {warning ? (
-          <AlertTriangle className="w-4 h-4" style={{ color: RED }} />
-        ) : (
-          <ChevronRight className="w-4 h-4 text-gray-300" />
-        )}
-      </div>
+      ))}
     </div>
   );
 }
 
-// ─── 1. ROOT APP COMPONENT ───────────────────────────────────────────────────
+// ─── Main App Components ─────────────────────────────────────────────────────
 
 export default function App() {
   const [sessionActive, setSessionActive] = useState(false);
@@ -757,15 +648,11 @@ export default function App() {
     condition: "B",
     participantId: "",
     researcher: "",
-    glutenFree: false,
-    accomTier: null,
-    selectedHotel: null,
-    editApplied: false,
-    conflictActive: false,
+    metrics: { cost: "0", prefs: "0", days: "0" },
+    tags: [],
+    plan: [],
+    focusDay: null,
   });
-
-  const updateState = (patch: Partial<S>) =>
-    setState((s) => ({ ...s, ...patch }));
 
   return (
     <div
@@ -776,7 +663,7 @@ export default function App() {
         {!sessionActive ? (
           <SetupScreen
             state={state}
-            update={updateState}
+            update={(p) => setState((s) => ({ ...s, ...p }))}
             onLaunch={() => setSessionActive(true)}
           />
         ) : state.condition === "A" ? (
@@ -787,7 +674,7 @@ export default function App() {
         ) : (
           <ConditionBScreen
             state={state}
-            updateState={updateState}
+            updateState={(p) => setState((s) => ({ ...s, ...p }))}
             onEndSession={() => setSessionActive(false)}
           />
         )}
@@ -795,8 +682,6 @@ export default function App() {
     </div>
   );
 }
-
-// ─── 2. START SCREEN ─────────────────────────────────────────────────────────
 
 function SetupScreen({
   state,
@@ -811,10 +696,8 @@ function SetupScreen({
   const [validationError, setValidationError] = useState(false);
 
   const handleLaunch = () => {
-    if (state.participantId.trim() === "" || state.researcher.trim() === "") {
-      setValidationError(true);
-      return;
-    }
+    if (!state.participantId.trim() || !state.researcher.trim())
+      return setValidationError(true);
     setValidationError(false);
     setLaunching(true);
     setTimeout(() => {
@@ -824,140 +707,81 @@ function SetupScreen({
   };
 
   return (
-    <div className="h-full flex flex-col" style={{ background: "#F1F3F6" }}>
-      <div className="px-6 py-3 border-b border-gray-200 flex items-center justify-between bg-white flex-shrink-0 shadow-sm z-10">
-        <div className="flex items-center gap-2">
-          <FlaskConical className="w-5 h-5" style={{ color: T }} />
-          <span className="text-sm font-bold text-gray-700">
-            Voyager AI Lab Research Console
-          </span>
+    <div className="h-full flex flex-col items-center justify-center px-8 pb-10">
+      <div className="w-full max-w-[560px] bg-white rounded-3xl border border-gray-200 shadow-xl overflow-hidden">
+        <div className="px-8 py-6 border-b border-gray-100 bg-slate-50">
+          <h2 className="text-xl font-bold text-slate-800">
+            Voyager AI Lab Console
+          </h2>
         </div>
-        <div className="flex items-center gap-4">
-          <label className="flex items-center gap-2">
-            <span className="text-xs text-gray-500">Participant ID:</span>
+        <div className="px-8 py-6 space-y-4">
+          <div className="flex gap-4">
             <input
               value={state.participantId}
               onChange={(e) => update({ participantId: e.target.value })}
-              className="border rounded-lg px-2.5 py-1.5 text-xs font-mono text-gray-700 bg-white focus:outline-none transition-colors"
+              className="flex-1 border rounded-lg px-3 py-2 text-sm"
               style={{
-                width: 100,
                 borderColor:
-                  validationError && !state.participantId ? RED : T_BORDER,
+                  validationError && !state.participantId ? RED : "#e2e8f0",
               }}
-              placeholder="e.g. P-042"
+              placeholder="Participant ID"
             />
-          </label>
-          <div className="w-px h-5 bg-gray-200" />
-          <label className="flex items-center gap-2">
-            <span className="text-xs text-gray-500">Researcher:</span>
             <input
               value={state.researcher}
               onChange={(e) => update({ researcher: e.target.value })}
-              className="border rounded-lg px-2.5 py-1.5 text-xs text-gray-700 bg-white focus:outline-none transition-colors"
+              className="flex-1 border rounded-lg px-3 py-2 text-sm"
               style={{
-                width: 130,
                 borderColor:
-                  validationError && !state.researcher ? RED : "#E5E7EB",
+                  validationError && !state.researcher ? RED : "#e2e8f0",
               }}
-              placeholder="Name..."
+              placeholder="Researcher Name"
             />
-          </label>
-        </div>
-      </div>
-      <div className="flex-1 flex items-center justify-center px-8">
-        <div className="w-full max-w-[560px] bg-white rounded-3xl border border-gray-200 shadow-sm overflow-hidden">
-          <div
-            className="px-8 py-6 border-b border-gray-100"
-            style={{ background: T_LIGHT }}
-          >
-            <div
-              className="text-xs font-bold tracking-widest uppercase mb-1"
-              style={{ color: T }}
-            >
-              Experimental Setup
-            </div>
-            <h2 className="text-2xl font-semibold text-gray-800">
-              Researcher Control Panel
-            </h2>
-            <p className="text-sm text-gray-500 mt-1">
-              Select the condition to activate for this participant session.
-            </p>
           </div>
-          <div className="px-8 py-6 space-y-4">
-            {validationError && (
-              <div className="flex items-center gap-2 text-xs font-medium text-red-600 bg-red-50 p-3 rounded-lg border border-red-200 mb-2">
-                <AlertTriangle className="w-4 h-4" /> Please provide a
-                Participant ID and Researcher Name to start.
-              </div>
-            )}
-
-            {(["A", "B"] as const).map((cond) => (
-              <label
-                key={cond}
-                className="flex items-start gap-4 p-4 rounded-2xl border-2 cursor-pointer transition-all"
+          {(["A", "B"] as const).map((cond) => (
+            <label
+              key={cond}
+              className="flex items-start gap-4 p-4 rounded-xl border-2 cursor-pointer transition-all"
+              style={{
+                borderColor: state.condition === cond ? T : "#E5E7EB",
+                background: state.condition === cond ? T_LIGHT : "#FAFAFA",
+              }}
+              onClick={() => update({ condition: cond })}
+            >
+              <div
+                className="w-5 h-5 rounded-full border-2 flex items-center justify-center mt-0.5"
                 style={{
-                  borderColor: state.condition === cond ? T : "#E5E7EB",
-                  background: state.condition === cond ? T_LIGHT : "#FAFAFA",
+                  borderColor: state.condition === cond ? T : "#D1D5DB",
                 }}
-                onClick={() => update({ condition: cond })}
               >
-                <div
-                  className="w-5 h-5 rounded-full border-2 flex items-center justify-center mt-0.5 flex-shrink-0 transition-colors"
-                  style={{
-                    borderColor: state.condition === cond ? T : "#D1D5DB",
-                  }}
-                >
-                  {state.condition === cond && (
-                    <div
-                      className="w-2.5 h-2.5 rounded-full"
-                      style={{ background: T }}
-                    />
-                  )}
-                </div>
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span
-                      className="text-sm font-semibold"
-                      style={{
-                        color: state.condition === cond ? T : "#374151",
-                      }}
-                    >
-                      Condition {cond} –{" "}
-                      {cond === "A"
-                        ? "Directive Vanilla LLM Baseline"
-                        : "Maieutic Socratic Planner"}
-                    </span>
-                  </div>
-                  <div className="text-xs text-gray-400 mt-1">
-                    {cond === "A"
-                      ? "Standard prompt-response. Full itinerary generated instantly. No interactive UI or preference capture."
-                      : "AI-guided preference elicitation with dynamic UI, live metrics grid, and conflict resolution protocols."}
-                  </div>
-                </div>
-              </label>
-            ))}
-            <button
-              onClick={handleLaunch}
-              className="w-full py-3.5 rounded-2xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-opacity"
-              style={{ background: T, opacity: launching ? 0.75 : 1 }}
-            >
-              {launching ? (
-                "Starting session..."
-              ) : (
-                <>
-                  <Play className="w-4 h-4" />
-                  Launch Session
-                </>
-              )}
-            </button>
-          </div>
+                {state.condition === cond && (
+                  <div
+                    className="w-2.5 h-2.5 rounded-full"
+                    style={{ background: T }}
+                  />
+                )}
+              </div>
+              <div className="text-sm font-semibold text-slate-800">
+                Condition {cond}{" "}
+                {cond === "B" && (
+                  <span className="ml-2 text-[10px] bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">
+                    Socratic / OpenUI
+                  </span>
+                )}
+              </div>
+            </label>
+          ))}
+          <button
+            onClick={handleLaunch}
+            className="w-full py-3 rounded-xl text-sm font-bold text-white shadow-md transition-transform hover:scale-[1.02]"
+            style={{ background: T }}
+          >
+            {launching ? "Starting..." : "Launch Session"}
+          </button>
         </div>
       </div>
     </div>
   );
 }
-
-// ─── 3. CONDITION A (Baseline) ────────────────────────────────────────────────
 
 function ConditionAScreen({
   state,
@@ -968,15 +792,14 @@ function ConditionAScreen({
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const sessionStartTime = useRef<number>(Date.now());
-  const sessionStartStr = useRef<string>(new Date().toISOString());
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const startRef = useRef({ time: Date.now(), str: new Date().toISOString() });
+  const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleSendMessage = async (text: string) => {
+  const handleSend = async (text: string) => {
     const userMsg: Message = {
       id: Date.now().toString(),
       text,
@@ -1010,53 +833,38 @@ function ConditionAScreen({
         ];
       });
     });
-
     setIsLoading(false);
   };
 
-  const handleEndSession = () => {
-    generateCSVAndDownload(
-      state.participantId,
-      state.researcher,
-      "A",
-      sessionStartStr.current,
-      Math.round((Date.now() - sessionStartTime.current) / 1000),
-      messages,
-    );
-    onEndSession();
-  };
-
   return (
-    <div className="h-full flex flex-col bg-white w-1/2 mx-auto border-x border-gray-200 shadow-xl relative">
-      <ChatHeader onEndSession={handleEndSession} />
+    <div className="h-full flex flex-col bg-white w-1/2 mx-auto border-x border-gray-200 shadow-2xl relative">
+      <ChatHeader
+        onEndSession={() => {
+          generateCSVAndDownload(
+            state,
+            startRef.current.str,
+            Math.round((Date.now() - startRef.current.time) / 1000),
+            messages,
+          );
+          onEndSession();
+        }}
+      />
       <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col">
-        {messages.length === 0 ? (
-          <div className="flex-1 flex flex-col items-center justify-center opacity-50">
-            <Sparkles className="w-8 h-8 mb-2" style={{ color: T }} />
-            <p className="text-sm text-gray-500">Start the conversation...</p>
-          </div>
-        ) : (
-          messages.map((msg) =>
-            msg.sender === "user" ? (
-              <UserBubble key={msg.id}>{msg.text}</UserBubble>
-            ) : (
-              <AIBubble
-                key={msg.id}
-                message={msg}
-                state={state}
-                update={() => {}}
-              />
-            ),
-          )
-        )}
-        <div ref={messagesEndRef} />
+        {messages.map((m) => (
+          <ChatMessageRow
+            key={m.id}
+            message={m}
+            state={state}
+            onAction={() => {}}
+            updateState={() => {}}
+          />
+        ))}
+        <div ref={endRef} />
       </div>
-      <ChatInputBar onSend={handleSendMessage} disabled={isLoading} />
+      <ChatInputBar onSend={handleSend} disabled={isLoading} />
     </div>
   );
 }
-
-// ─── 4. CONDITION B (Socratic Planner) ────────────────────────────────────────
 
 function ConditionBScreen({
   state,
@@ -1067,26 +875,16 @@ function ConditionBScreen({
   updateState: (p: Partial<S>) => void;
   onEndSession: () => void;
 }) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: "init",
-      text: "Describe your dream trip and I'll build your personalised itinerary step by step.",
-      sender: "ai",
-      timestamp: getTimestamp(),
-      wordCount: 0,
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-
-  const sessionStartTime = useRef<number>(Date.now());
-  const sessionStartStr = useRef<string>(new Date().toISOString());
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const startRef = useRef({ time: Date.now(), str: new Date().toISOString() });
+  const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleSendMessage = async (text: string) => {
+  const handleSend = async (text: string) => {
     const userMsg: Message = {
       id: Date.now().toString(),
       text,
@@ -1094,9 +892,7 @@ function ConditionBScreen({
       timestamp: getTimestamp(),
       wordCount: countWords(text),
     };
-    const filteredPrev = messages.filter((m) => m.id !== "init");
-    const newHistory = [...filteredPrev, userMsg];
-
+    const newHistory = [...messages, userMsg];
     setMessages(newHistory);
     setIsLoading(true);
 
@@ -1115,133 +911,80 @@ function ConditionBScreen({
     await callGeminiAPIStream(newHistory, "B", state, (chunk) => {
       setMessages((prev) => {
         const last = prev[prev.length - 1];
-        const newText = last.text + chunk;
-
-        // Simulating passive state extraction: if AI mentions gluten-free, toggle it.
-        if (
-          newText.toLowerCase().includes("gluten-free") &&
-          !state.glutenFree
-        ) {
-          updateState({ glutenFree: true });
-        }
-
+        const { text: cleanText, ouiCode } = parseMessageContent(
+          last.text + chunk,
+        );
         return [
           ...prev.slice(0, -1),
-          { ...last, text: newText, wordCount: countWords(newText) },
+          {
+            ...last,
+            text: cleanText,
+            ouiCode: ouiCode || last.ouiCode,
+            wordCount: countWords(cleanText),
+          },
         ];
       });
     });
-
     setIsLoading(false);
   };
 
-  const handleEndSession = () => {
-    const exportMessages = messages.filter((m) => m.id !== "init");
-    generateCSVAndDownload(
-      state.participantId,
-      state.researcher,
-      "B",
-      sessionStartStr.current,
-      Math.round((Date.now() - sessionStartTime.current) / 1000),
-      exportMessages,
-    );
-    onEndSession();
+  const setEditFocus = (day: number) => {
+    updateState({ focusDay: day });
+    handleSend(`I want to edit Day ${day}.`);
   };
 
-  // Derive tags for Preference section based on state
-  const activeTags = [];
-  if (state.glutenFree) activeTags.push("Gluten-free");
-  if (state.accomTier) activeTags.push(state.accomTier);
-
   return (
-    <div className="h-full flex w-full">
-      <div className="w-[400px] flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10 relative">
-        <ChatHeader onEndSession={handleEndSession} />
-
-        <div className="flex-1 flex flex-col overflow-y-auto px-5 pt-4 pb-2">
-          {messages.map((msg) => {
-            if (msg.sender === "user")
-              return <UserBubble key={msg.id}>{msg.text}</UserBubble>;
-            if (msg.id === "init") {
-              return (
-                <div
-                  key={msg.id}
-                  className="w-full rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 flex flex-col items-center gap-3 mb-4 mt-auto"
-                  style={{ background: "#FAFAFA" }}
-                >
-                  <div
-                    className="w-12 h-12 rounded-full flex items-center justify-center"
-                    style={{ background: T_LIGHT }}
-                  >
-                    <Sparkles className="w-6 h-6" style={{ color: T }} />
-                  </div>
-                  <p className="text-sm text-gray-400 text-center leading-relaxed">
-                    {msg.text}
-                  </p>
-                </div>
-              );
-            }
-            return (
-              <AIBubble
-                key={msg.id}
-                message={msg}
-                state={state}
-                update={updateState}
-              />
+    <div className="h-full flex w-full bg-slate-50">
+      <div className="w-1/3 flex flex-col border-r border-gray-200 bg-white shadow-xl z-10 relative">
+        <ChatHeader
+          onEndSession={() => {
+            generateCSVAndDownload(
+              state,
+              startRef.current.str,
+              Math.round((Date.now() - startRef.current.time) / 1000),
+              messages,
             );
-          })}
-          <div ref={messagesEndRef} />
-        </div>
-
-        <ChatInputBar onSend={handleSendMessage} disabled={isLoading} />
-      </div>
-
-      <div className="flex-1 flex flex-col" style={{ background: "#F8FAFC" }}>
-        <MetricsGrid state={state} />
-
-        <div className="flex-1 px-8 py-6 relative overflow-y-auto">
-          {messages.length <= 1 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center max-w-sm mx-auto opacity-60">
-              <div
-                className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
-                style={{ background: T_LIGHT }}
+            onEndSession();
+          }}
+        />
+        <div className="flex-1 flex flex-col overflow-y-auto px-5 pt-5 pb-2">
+          {state.focusDay && (
+            <div
+              className="mb-4 text-xs font-bold text-white py-1.5 px-3 rounded-md self-center flex items-center gap-2"
+              style={{ background: T }}
+            >
+              <Pencil size={12} /> Focus: Editing Day {state.focusDay}
+              <button
+                onClick={() => updateState({ focusDay: null })}
+                className="ml-2 hover:text-red-200"
               >
-                <CalendarDays className="w-7 h-7" style={{ color: T }} />
-              </div>
-              <p className="text-sm text-gray-400 leading-relaxed">
-                Your AI-generated itinerary and live tracking metrics will
-                appear here once you start the conversation.
-              </p>
-            </div>
-          ) : (
-            <div className="max-w-2xl mx-auto space-y-4 pb-12">
-              <div className="text-[10px] font-bold tracking-widest uppercase text-gray-400 mb-2">
-                High-Level Itinerary Artifact
-              </div>
-              <DayCardCollapsed
-                day="Day 1 – Zurich"
-                sub="Arrival – Old Town"
-                hotel={state.accomTier ? "Hotel Adler" : undefined}
-              />
-              {state.accomTier && (
-                <DayCardCollapsed
-                  day="Day 2 – Paris"
-                  sub="Eiffel Tower – Louvre"
-                  hotel={state.accomTier ? "Hôtel Grands Hommes" : undefined}
-                  spend="145 CHF"
-                />
-              )}
-              {state.conflictActive && (
-                <DayCardCollapsed
-                  day="Day 3 – Alpine Tour ⚠️"
-                  sub="Helicopter Tour – OVER BUDGET"
-                  warning
-                />
-              )}
+                <XCircle size={14} />
+              </button>
             </div>
           )}
+          {messages.map((m) => (
+            <ChatMessageRow
+              key={m.id}
+              message={m}
+              state={state}
+              onAction={handleSend}
+              updateState={updateState}
+            />
+          ))}
+          <div ref={endRef} />
         </div>
+        <ChatInputBar onSend={handleSend} disabled={isLoading} />
+      </div>
 
+      <div className="w-2/3 flex flex-col">
+        <MetricsGrid metrics={state.metrics} />
+        <div className="flex-1 px-8 relative overflow-y-auto">
+          <ItineraryArtifact
+            plan={state.plan}
+            focusDay={state.focusDay}
+            onSetFocus={setEditFocus}
+          />
+        </div>
         <div
           className="flex-shrink-0 border-t border-gray-200 px-6 py-3"
           style={{ background: PREFS_BG }}
@@ -1250,22 +993,20 @@ function ConditionBScreen({
             className="text-[9px] font-bold tracking-widest uppercase mb-1.5"
             style={{ color: "#5A7090" }}
           >
-            Active Constraints
+            Extracted Constraints
           </div>
-          {activeTags.length === 0 ? (
+          {state.tags.length === 0 ? (
             <p className="text-xs italic" style={{ color: "#7A90AA" }}>
               No preferences captured yet.
             </p>
           ) : (
-            <div className="flex flex-wrap gap-1.5">
-              {activeTags.map((tag) => (
+            <div className="flex gap-1.5">
+              {state.tags.map((t) => (
                 <span
-                  key={tag}
-                  className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
-                  style={{ background: T }}
+                  key={t}
+                  className="px-2 py-0.5 rounded-full text-[10px] font-semibold text-white bg-slate-700"
                 >
-                  <Check className="w-3 h-3" />
-                  {tag}
+                  {t}
                 </span>
               ))}
             </div>
