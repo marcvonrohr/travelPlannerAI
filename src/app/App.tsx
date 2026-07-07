@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, KeyboardEvent, useRef, useEffect } from "react";
 import {
   Pencil,
   ChevronDown,
@@ -18,6 +18,10 @@ import {
   Hotel,
   XCircle,
 } from "lucide-react";
+
+// --- Configuration ---
+// Define the model for Step 2 in advance
+export const GEMINI_MODEL = "gemini-3.0-pro";
 
 // --- Original Design tokens ---
 const T = "#0B7A75";
@@ -49,6 +53,13 @@ interface S {
   selectedHotel: string | null;
   editApplied: boolean;
 }
+
+// --- Chat Message Type ---
+export type Message = {
+  id: string;
+  text: string;
+  sender: "user" | "ai";
+};
 
 // --- Static data ---
 const DAY_HOTELS = {
@@ -82,7 +93,7 @@ const DAY2_UPDATED = [
   { time: "19:00", name: "Dinner – Le Comptoir", note: "GF ✓", changed: false },
 ];
 
-// --- Original Chat primitives (mit End Session Button erweitert) ---
+// --- Chat primitives ---
 function ChatHeader({
   editMode = false,
   onEndSession,
@@ -217,36 +228,49 @@ function UserBubble({
   );
 }
 
-function ChatInputBar({
-  value = "Type a message...",
-  highlight = false,
-}: {
-  value?: string;
-  highlight?: boolean;
-}) {
+// Unified Chat Input Component
+function ChatInputBar({ onSend }: { onSend: (msg: string) => void }) {
+  const [text, setText] = useState("");
+
+  const handleSend = () => {
+    if (text.trim() === "") return;
+    onSend(text);
+    setText("");
+  };
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      handleSend();
+    }
+  };
+
   return (
-    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0">
+    <div className="border-t border-gray-100 px-4 py-3 flex-shrink-0 bg-white">
       <div
         className="flex items-center gap-2.5 rounded-xl px-4 py-2.5 border"
-        style={
-          highlight
-            ? { background: T_LIGHT, borderColor: T_BORDER }
-            : { background: "#F9FAFB", borderColor: "#E5E7EB" }
-        }
+        style={{ background: "#F9FAFB", borderColor: "#E5E7EB" }}
       >
-        <span className="flex-1 text-sm text-gray-500">{value}</span>
-        <div
-          className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0"
+        <input
+          type="text"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Type a message..."
+          className="flex-1 text-sm bg-transparent outline-none text-gray-700"
+        />
+        <button
+          onClick={handleSend}
+          className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105 flex-shrink-0 cursor-pointer"
           style={{ background: T }}
         >
           <ArrowRight className="w-4 h-4 text-white" />
-        </div>
+        </button>
       </div>
     </div>
   );
 }
 
-// --- Original Right panel components ---
+// --- Right panel components ---
 type MC = {
   label: string;
   value: string;
@@ -364,7 +388,7 @@ function PreferencesSection({
 export default function App() {
   const [sessionActive, setSessionActive] = useState(false);
   const [state, setState] = useState<S>({
-    condition: "B", // Standardmäßig Condition B
+    condition: "B", // Default to Condition B
     glutenFree: false,
     accomTier: null,
     selectedHotel: null,
@@ -375,16 +399,15 @@ export default function App() {
     setState((s) => ({ ...s, ...patch }));
 
   const endSession = () => {
-    // Hier kommt später in Schritt 4 der Download-Export-Trigger hin
+    // In step 4, the JSON export logic will be triggered here
     setSessionActive(false);
   };
 
   return (
     <div
       className="h-screen flex flex-col overflow-hidden"
-      style={{ fontFamily: "'Inter', sans-serif" }}
+      style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}
     >
-      {/* Das UI skaliert automatisch auf 100vh. Keine PrototypeNav mehr. */}
       <div className="flex-1 overflow-hidden">
         {!sessionActive ? (
           <SetupScreen
@@ -402,7 +425,7 @@ export default function App() {
   );
 }
 
-// ─── 2. START SCREEN (Dein originales Screen00) ────────────────────────────────
+// ─── 2. START SCREEN (Setup & Validation) ─────────────────────────────────────
 
 function SetupScreen({
   state,
@@ -414,7 +437,18 @@ function SetupScreen({
   onLaunch: () => void;
 }) {
   const [launching, setLaunching] = useState(false);
+  const [participantId, setParticipantId] = useState("");
+  const [researcher, setResearcher] = useState("");
+  const [validationError, setValidationError] = useState(false);
+
   const handleLaunch = () => {
+    // Validation: Require both inputs before starting
+    if (participantId.trim() === "" || researcher.trim() === "") {
+      setValidationError(true);
+      return;
+    }
+
+    setValidationError(false);
     setLaunching(true);
     setTimeout(() => {
       setLaunching(false);
@@ -428,25 +462,35 @@ function SetupScreen({
         <div className="flex items-center gap-2">
           <FlaskConical className="w-5 h-5" style={{ color: T }} />
           <span className="text-sm font-bold text-gray-700">
-            VoyagerLab Research Console
+            Voyager AI Lab Research Console
           </span>
         </div>
         <div className="flex items-center gap-4">
           <label className="flex items-center gap-2">
             <span className="text-xs text-gray-500">Participant ID:</span>
             <input
-              className="border rounded-lg px-2.5 py-1.5 text-xs font-mono text-gray-700 bg-white focus:outline-none"
-              style={{ width: 80, borderColor: T_BORDER }}
-              defaultValue="P-042"
+              value={participantId}
+              onChange={(e) => setParticipantId(e.target.value)}
+              className="border rounded-lg px-2.5 py-1.5 text-xs font-mono text-gray-700 bg-white focus:outline-none transition-colors"
+              style={{
+                width: 100,
+                borderColor: validationError && !participantId ? RED : T_BORDER,
+              }}
+              placeholder="e.g. P-042"
             />
           </label>
           <div className="w-px h-5 bg-gray-200" />
           <label className="flex items-center gap-2">
             <span className="text-xs text-gray-500">Researcher:</span>
             <input
-              className="border border-gray-200 rounded-lg px-2.5 py-1.5 text-xs text-gray-700 bg-white focus:outline-none"
-              style={{ width: 130 }}
-              defaultValue="Dr. M. Petit"
+              value={researcher}
+              onChange={(e) => setResearcher(e.target.value)}
+              className="border rounded-lg px-2.5 py-1.5 text-xs text-gray-700 bg-white focus:outline-none transition-colors"
+              style={{
+                width: 130,
+                borderColor: validationError && !researcher ? RED : "#E5E7EB",
+              }}
+              placeholder="Name..."
             />
           </label>
         </div>
@@ -471,6 +515,13 @@ function SetupScreen({
             </p>
           </div>
           <div className="px-8 py-6 space-y-4">
+            {validationError && (
+              <div className="flex items-center gap-2 text-xs font-medium text-red-600 bg-red-50 p-3 rounded-lg border border-red-200 mb-2">
+                <AlertTriangle className="w-4 h-4" /> Please provide a
+                Participant ID and Researcher Name to start.
+              </div>
+            )}
+
             {(["A", "B"] as const).map((cond) => (
               <label
                 key={cond}
@@ -548,83 +599,134 @@ function SetupScreen({
   );
 }
 
-// ─── 3. CONDITION A (Dein originales Screen01B Baseline Layout) ─────────────────
+// ─── 3. CONDITION A (Baseline) ────────────────────────────────────────────────
 
 function ConditionAScreen({ onEndSession }: { onEndSession: () => void }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to the bottom when messages update
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSendMessage = (text: string) => {
+    const newUserMsg: Message = {
+      id: Date.now().toString(),
+      text,
+      sender: "user",
+    };
+    setMessages((prev) => [...prev, newUserMsg]);
+
+    // In Step 2: Call the Gemini API here
+  };
+
   return (
-    <div className="h-full flex flex-col bg-white max-w-3xl mx-auto w-full border-x border-gray-100 shadow-sm">
+    <div className="h-full flex flex-col bg-white w-1/2 mx-auto border-x border-gray-200 shadow-xl relative">
       <ChatHeader onEndSession={onEndSession} />
-      <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4">
-        {/* Placeholder für leeren Start. In Schritt 2 kommt hier die Chat-Historie */}
-        <div className="flex justify-end items-end gap-2 mb-3">
-          <div
-            className="rounded-2xl rounded-tr-none px-5 py-3 text-sm leading-relaxed text-white"
-            style={{ background: T, maxWidth: "70%" }}
-          >
-            Plan a trip to Europe for 7 days with a 1500 CHF budget.
+
+      <div className="flex-1 overflow-y-auto px-6 py-5 flex flex-col">
+        {messages.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center opacity-50">
+            <Sparkles className="w-8 h-8 mb-2" style={{ color: T }} />
+            <p className="text-sm text-gray-500">Start the conversation...</p>
           </div>
-        </div>
+        ) : (
+          messages.map((msg) =>
+            msg.sender === "user" ? (
+              <UserBubble key={msg.id}>{msg.text}</UserBubble>
+            ) : (
+              <AIBubble key={msg.id}>{msg.text}</AIBubble>
+            ),
+          )
+        )}
+        <div ref={messagesEndRef} />
       </div>
-      <div className="border-t border-gray-100 px-6 py-3.5 flex-shrink-0">
-        <div className="flex items-center gap-2.5 bg-gray-50 rounded-xl px-4 py-3 border border-gray-200">
-          <input
-            type="text"
-            placeholder="Type a message..."
-            className="flex-1 text-sm bg-transparent outline-none"
-          />
-          <button
-            className="w-8 h-8 rounded-full flex items-center justify-center transition-transform hover:scale-105"
-            style={{ background: T }}
-          >
-            <ArrowRight className="w-4 h-4 text-white" />
-          </button>
-        </div>
-      </div>
+
+      <ChatInputBar onSend={handleSendMessage} />
     </div>
   );
 }
 
-// ─── 4. CONDITION B (Dein originales Screen01/02 Layout) ──────────────────────
+// ─── 4. CONDITION B (Socratic Planner) ────────────────────────────────────────
 
 function ConditionBScreen({ onEndSession }: { onEndSession: () => void }) {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: "init",
+      text: "Describe your dream trip and I'll build your personalised itinerary step by step.",
+      sender: "ai",
+    },
+  ]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to the bottom when messages update
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSendMessage = (text: string) => {
+    const newUserMsg: Message = {
+      id: Date.now().toString(),
+      text,
+      sender: "user",
+    };
+
+    setMessages((prev) => {
+      // Remove the initial welcome box if it's the first message from the user
+      const filteredMessages = prev.filter((m) => m.id !== "init");
+      return [...filteredMessages, newUserMsg];
+    });
+
+    // In Step 2: Call the Gemini API here
+  };
+
   return (
-    <div className="h-full flex">
+    <div className="h-full flex w-full">
       {/* Left Sidebar: Chat */}
-      <div className="w-[380px] flex flex-col border-r border-gray-100 flex-shrink-0 bg-white shadow-sm z-10">
+      <div className="w-1/3 flex flex-col border-r border-gray-200 flex-shrink-0 bg-white shadow-xl z-10">
         <ChatHeader onEndSession={onEndSession} />
 
         <div className="flex-1 flex flex-col overflow-y-auto px-5 pt-4 pb-2">
-          {/* Platzhalter: Leerer Start (aus Screen01) */}
-          <div className="flex-1 flex items-end justify-center mb-4">
-            <div
-              className="w-full rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 flex flex-col items-center gap-3"
-              style={{ background: "#FAFAFA" }}
-            >
-              <div
-                className="w-12 h-12 rounded-full flex items-center justify-center"
-                style={{ background: T_LIGHT }}
-              >
-                <Sparkles className="w-6 h-6" style={{ color: T }} />
-              </div>
-              <p className="text-sm text-gray-400 text-center leading-relaxed">
-                Describe your dream trip and I'll build your personalised
-                itinerary step by step.
-              </p>
-            </div>
-          </div>
-          {/* Chat Historie landet in Schritt 2 hier */}
+          {messages.map((msg) => {
+            if (msg.sender === "user") {
+              return <UserBubble key={msg.id}>{msg.text}</UserBubble>;
+            } else {
+              // Render initial placeholder box
+              if (msg.id === "init") {
+                return (
+                  <div
+                    key={msg.id}
+                    className="w-full rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 flex flex-col items-center gap-3 mb-4"
+                    style={{ background: "#FAFAFA" }}
+                  >
+                    <div
+                      className="w-12 h-12 rounded-full flex items-center justify-center"
+                      style={{ background: T_LIGHT }}
+                    >
+                      <Sparkles className="w-6 h-6" style={{ color: T }} />
+                    </div>
+                    <p className="text-sm text-gray-400 text-center leading-relaxed">
+                      {msg.text}
+                    </p>
+                  </div>
+                );
+              }
+              return <AIBubble key={msg.id}>{msg.text}</AIBubble>;
+            }
+          })}
+          <div ref={messagesEndRef} />
         </div>
 
-        <ChatInputBar highlight />
+        <ChatInputBar onSend={handleSendMessage} />
       </div>
 
       {/* Right Panel: Socratic Dashboard */}
       <div className="flex-1 flex flex-col" style={{ background: "#F8FAFC" }}>
-        {/* Placeholder: Leeres Metrics Grid */}
         <MetricsGrid metrics={M_EMPTY} />
 
         <div className="flex-1 flex items-center justify-center px-8 relative overflow-y-auto">
-          {/* Platzhalter für den leeren Start. In Schritt 3 kommen hier die OpenUI Komponenten hin */}
+          {/* OpenUI components will be rendered here in Step 3 */}
           <div className="text-center max-w-sm">
             <div
               className="w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4"
@@ -639,7 +741,6 @@ function ConditionBScreen({ onEndSession }: { onEndSession: () => void }) {
           </div>
         </div>
 
-        {/* Preferences / Constraints Panel */}
         <PreferencesSection empty />
       </div>
     </div>
