@@ -22,13 +22,13 @@ import {
   BuiltinActionType,
   Renderer,
   createLibrary,
+  createParser,
   defineComponent,
   useIsStreaming,
   useTriggerAction,
   type ActionEvent,
   type ElementNode,
   type OpenUIError,
-  type ParseResult,
 } from "@openuidev/react-lang";
 import { z } from "zod/v4";
 
@@ -104,12 +104,17 @@ type TripState = {
   days: DayPlan[];
 };
 
+type FocusTarget =
+  | { type: "day"; day: number; label: string }
+  | { type: "hotel"; day: number; label: string }
+  | { type: "activity"; day: number; activityIndex: number; activityName: string; label: string };
+
 interface S {
   condition: Condition;
   participantId: string;
   researcher: string;
   trip: TripState;
-  focusDay: number | null;
+  focus: FocusTarget | null;
 }
 
 export type Message = {
@@ -117,6 +122,7 @@ export type Message = {
   text: string;
   rawText: string;
   openUI?: string;
+  openUIError?: string;
   sender: "user" | "ai";
   source?: "typed" | "ui_action";
   timestamp: string;
@@ -452,6 +458,9 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Use English for all prose and UI labels.",
     "After the user provides 3-4 basics (destination or region, budget, duration, travelers), stop asking broad setup questions and propose a first high-level route.",
     "Ask at most one focused Socratic question at a time before the first route is proposed.",
+    "In the first 2-3 assistant turns, keep widgets sparse. Prefer text-first Socratic questioning and use at most one small widget only if it supports the single question being asked.",
+    "For vague starts like \"I want to travel\", ask one destination or region question instead of offering many predefined trip concepts.",
+    "For inputs such as \"I need gluten-free food and want Japan\", capture both destination and dietary preference in StateUpdate, then ask one missing basic such as duration, travelers, or budget.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
@@ -484,17 +493,14 @@ conflict = ConflictWarning("The helicopter tour adds about 380 CHF and pushes th
 });
 
 // --- Prompts and context ------------------------------------------------------
-const SYSTEM_PROMPT_A = `You are a highly efficient and directive travel assistant.
-Your goal is to provide complete, detailed travel itineraries immediately based on the user's request.
-Give the user exactly what they ask for in a structured, comprehensive markdown format. Do not ask follow-up questions. Provide the full plan quickly.
-Reply in English.`;
-
 const SYSTEM_PROMPT_B = `You are the experimental Socratic Planner for a travel-planning study.
 
 Behavior rules:
 - You are a maieutic guide, not a zero-shot itinerary generator.
 - Your purpose is to elicit missing constraints, expose trade-offs, and help the user co-create the itinerary.
 - Do not ask endless setup questions. Once destination or region, budget, duration, and travelers are known or strongly implied, propose a first route.
+- In the first 2-3 assistant turns, keep quick replies sparse and never replace the user's own reflection with a large menu of choices.
+- For vague openings, ask one focused question; for concrete constraints such as gluten-free food and Japan, capture them immediately in StateUpdate.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
 - If the user clicks an interactive widget, treat the resulting user message as an explicit choice.
@@ -503,17 +509,17 @@ Behavior rules:
 ${OPENUI_PROMPT}`;
 
 const getTravelContextString = (condition: Condition, state: S) => {
-  if (condition === "A") return "Context: No active constraints are tracked in the directive baseline.";
+  if (condition === "A") return "";
 
   return `CURRENT HIDDEN EXPERIMENT CONTEXT:
 ${JSON.stringify(
   {
     condition: state.condition,
-    focusDay: state.focusDay,
+    focus: state.focus,
     focusInstruction:
-      state.focusDay !== null
-        ? `The next user request applies only to Day ${state.focusDay}. Only that day should change.`
-        : "No day-specific focus is active.",
+      state.focus !== null
+        ? `The next user request applies only to ${state.focus.label}. Preserve all other itinerary data unless the user explicitly broadens the scope.`
+        : "No focus target is active.",
     trip: state.trip,
     computedMetrics: computeTripMetrics(state.trip),
   },
@@ -570,9 +576,10 @@ const generateCSVAndDownload = (
       : Math.round((userMessages.reduce((sum, m) => sum + m.wordCount, 0) / totalUserTurns) * 100) / 100;
   const uiInterventions = events.filter((event) => event.type === "ui_action").length;
   const finalTripState = JSON.stringify(state.trip);
+  const finalComputedMetrics = JSON.stringify(computeTripMetrics(state.trip));
 
   let csvContent =
-    "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,AverageUserWordCount,UIInterventions,EventID,EventType,Role,Timestamp,MessageID,Source,WordCount,Content,Metadata,FinalTripState\n";
+    "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,AverageUserWordCount,UIInterventions,EventID,EventType,Role,Timestamp,MessageID,Source,WordCount,Content,Metadata,FinalTripState,FinalComputedMetrics\n";
 
   events.forEach((event) => {
     const row = [
@@ -594,6 +601,7 @@ const generateCSVAndDownload = (
       event.content ?? "",
       event.metadata ?? {},
       finalTripState,
+      finalComputedMetrics,
     ].map(escapeCSV);
     csvContent += `${row.join(",")}\n`;
   });
@@ -624,13 +632,15 @@ const splitAssistantResponse = (rawText: string) => {
     }
   }
 
+  let malformedOpenUI: string | undefined;
+
   if (codeBlocks.length === 0) {
     const openingFence = rawText.match(/```(openui-lang|openui|oui)\s*\n/i);
     if (openingFence?.index !== undefined) {
       const codeStart = openingFence.index + openingFence[0].length;
       const openCode = rawText.slice(codeStart).replace(/```\s*$/, "").trim();
       if (openCode) {
-        codeBlocks.push(openCode);
+        malformedOpenUI = openCode;
         text = rawText.slice(0, openingFence.index);
       }
     }
@@ -644,6 +654,7 @@ const splitAssistantResponse = (rawText: string) => {
   return {
     text: text.trim(),
     openUI: codeBlocks.length ? codeBlocks.join("\n") : undefined,
+    malformedOpenUI,
   };
 };
 
@@ -851,6 +862,43 @@ const combineTripPatches = (patches: TripPatch[]): TripPatch => {
   }, {});
 };
 
+const parseTripPatchFromOpenUI = (openUI: string | undefined) => {
+  if (!openUI?.trim()) {
+    return { patch: undefined as TripPatch | undefined, errors: [] as OpenUIError[] };
+  }
+
+  try {
+    const parser = createParser(travelOpenUILibrary.toJSONSchema(), travelOpenUILibrary.root);
+    const result = parser.parse(openUI);
+    const patches = collectStateUpdatePatches(result.root);
+    const errors = result.meta.errors.map((error) => ({
+      source: "parser" as const,
+      code: error.code,
+      message: error.message,
+      statementId: error.statementId,
+      component: error.component,
+      path: error.path,
+    }));
+
+    return {
+      patch: patches.length ? combineTripPatches(patches) : undefined,
+      errors,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown OpenUI parse error";
+    return {
+      patch: undefined,
+      errors: [
+        {
+          source: "parser" as const,
+          code: "parse-exception" as const,
+          message,
+        },
+      ],
+    };
+  }
+};
+
 const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[]) => {
   if (!incoming) return existing;
   const byLabel = new Map(existing.map((pref) => [normalizeTextKey(pref.label), pref]));
@@ -860,22 +908,22 @@ const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[
   return Array.from(byLabel.values());
 };
 
-const mergeDays = (existing: DayPlan[], incoming?: DayPlan[], focusDay?: number | null) => {
+const mergeDays = (existing: DayPlan[], incoming?: DayPlan[], focus?: FocusTarget | null) => {
   if (!incoming) return existing;
-  if (focusDay && existing.length) {
-    const incomingFocusDay = incoming.find((day) => day.day === focusDay);
+  if (focus && existing.length) {
+    const incomingFocusDay = incoming.find((day) => day.day === focus.day);
     if (!incomingFocusDay) return existing;
-    return existing.map((day) => (day.day === focusDay ? incomingFocusDay : day));
+    return existing.map((day) => (day.day === focus.day ? incomingFocusDay : day));
   }
   return incoming;
 };
 
-const applyTripPatch = (trip: TripState, patch: TripPatch, focusDay?: number | null): TripState => ({
+const applyTripPatch = (trip: TripState, patch: TripPatch, focus?: FocusTarget | null): TripState => ({
   ...trip,
   ...patch,
   currency: patch.currency ?? trip.currency ?? "CHF",
   preferences: mergePreferences(trip.preferences, patch.preferences),
-  days: mergeDays(trip.days, patch.days, focusDay),
+  days: mergeDays(trip.days, patch.days, focus),
 });
 
 // --- Gemini API ---------------------------------------------------------------
@@ -890,27 +938,38 @@ const callGeminiAPIStream = async (
   onChunk: (chunk: string) => void,
   eventsRef?: React.MutableRefObject<SessionEvent[]>,
 ) => {
-  if (!GEMINI_API_KEY) {
+  const useDevProxy = typeof window !== "undefined" && window.location.protocol.startsWith("http");
+
+  if (!useDevProxy && !GEMINI_API_KEY) {
     const missingKeyMessage = "API key is missing. Set VITE_GEMINI_API_KEY in .env.local.";
     onChunk(missingKeyMessage);
     return missingKeyMessage;
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
-  const fullSystemPrompt = `${condition === "A" ? SYSTEM_PROMPT_A : SYSTEM_PROMPT_B}\n\n${getTravelContextString(condition, state)}`;
+  const directUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
+  const url = useDevProxy ? "/api/gemini/stream" : directUrl;
+  const requestId = makeId();
+  const contextString = getTravelContextString(condition, state);
+  const fullSystemPrompt = condition === "B" ? `${SYSTEM_PROMPT_B}\n\n${contextString}` : "";
   const contents = chatHistory.map((message) => ({
     role: message.sender === "user" ? "user" : "model",
     parts: [{ text: getMessageTextForModel(message) }],
   }));
 
-  const requestPayload = {
-    system_instruction: { parts: [{ text: fullSystemPrompt }] },
-    contents,
-  };
+  const requestPayload =
+    condition === "B"
+      ? {
+          system_instruction: { parts: [{ text: fullSystemPrompt }] },
+          contents,
+        }
+      : {
+          contents,
+        };
 
-  console.groupCollapsed(`[VoyagerLab] Gemini request ${new Date().toLocaleTimeString()}`);
+  console.groupCollapsed(`[VoyagerLab] Gemini request ${requestId} ${new Date().toLocaleTimeString()}`);
+  console.log("Condition", condition);
   console.log("Model", GEMINI_MODEL);
-  console.log("System prompt", fullSystemPrompt);
+  console.log("System prompt", fullSystemPrompt || "(none)");
   console.log("Complete history", contents);
   console.log("Request payload", requestPayload);
   console.groupEnd();
@@ -919,20 +978,24 @@ const callGeminiAPIStream = async (
     type: "api_request",
     role: "system",
     content: "Gemini request",
-    metadata: { model: GEMINI_MODEL, systemPrompt: fullSystemPrompt, contents },
+    metadata: { requestId, condition, model: GEMINI_MODEL, systemPrompt: fullSystemPrompt || null, contents },
   });
 
   let retries = 4;
   let delay = 1500;
   let rawResponse = "";
+  let attempt = 0;
 
   while (retries > 0) {
     try {
+      attempt += 1;
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestPayload),
+        body: JSON.stringify(useDevProxy ? { requestId, condition, model: GEMINI_MODEL, attempt, requestPayload } : requestPayload),
       });
+
+      console.log("[VoyagerLab] Gemini response status", { requestId, condition, attempt, status: response.status });
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => "");
@@ -968,7 +1031,7 @@ const callGeminiAPIStream = async (
         });
       }
 
-      console.groupCollapsed(`[VoyagerLab] Gemini raw response ${new Date().toLocaleTimeString()}`);
+      console.groupCollapsed(`[VoyagerLab] Gemini raw response ${requestId} ${new Date().toLocaleTimeString()}`);
       console.log(rawResponse);
       console.groupEnd();
 
@@ -976,14 +1039,14 @@ const callGeminiAPIStream = async (
         type: "api_response",
         role: "ai",
         content: rawResponse,
-        metadata: { model: GEMINI_MODEL },
+        metadata: { requestId, condition, model: GEMINI_MODEL },
       });
 
       return rawResponse;
     } catch (error) {
       if (error instanceof RetryableGeminiError && retries > 1) {
         retries -= 1;
-        console.info(`[VoyagerLab] Gemini high-demand response. Retrying in ${delay} ms.`);
+        console.info(`[VoyagerLab] Gemini high-demand response for ${requestId} attempt ${attempt}. Retrying in ${delay} ms.`);
         await sleep(delay);
         delay *= 2;
         continue;
@@ -991,10 +1054,17 @@ const callGeminiAPIStream = async (
 
       const message = error instanceof Error ? error.message : "Unknown Gemini error";
       console.error("[VoyagerLab] Gemini request failed", error);
+      postClientLog({
+        type: "gemini_request_failed",
+        requestId,
+        condition,
+        error: serializeError(error),
+      });
       appendEventIfAvailable(eventsRef, {
         type: "api_error",
         role: "system",
         content: message,
+        metadata: { requestId, condition },
       });
 
       const visibleMessage =
@@ -1014,6 +1084,32 @@ const appendEventIfAvailable = (
   event: Omit<SessionEvent, "id" | "timestamp">,
 ) => {
   if (eventsRef) appendEvent(eventsRef, event);
+};
+
+const postClientLog = (payload: Record<string, unknown>) => {
+  if (typeof window === "undefined" || !window.location.protocol.startsWith("http")) return;
+  fetch("/api/client-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      timestamp: new Date().toISOString(),
+      url: window.location.href,
+      ...payload,
+    }),
+  }).catch(() => {
+    // Logging must never affect the experiment UI.
+  });
+};
+
+const serializeError = (error: unknown) => {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+  return { message: String(error) };
 };
 
 // --- UI primitives ------------------------------------------------------------
@@ -1039,13 +1135,13 @@ function ChatHeader({ onEndSession }: { onEndSession?: () => void }) {
   );
 }
 
-function FocusBanner({ day, onCancel }: { day: number; onCancel: () => void }) {
+function FocusBanner({ focus, onCancel }: { focus: FocusTarget; onCancel: () => void }) {
   return (
     <div className="z-10 flex flex-shrink-0 items-center justify-between border-b px-5 py-2.5" style={{ background: T_LIGHT, borderColor: T_BORDER }}>
       <div className="flex items-center gap-2">
         <Pencil className="h-3.5 w-3.5" style={{ color: T }} />
         <span className="text-xs font-bold uppercase tracking-widest" style={{ color: T }}>
-          Focus: Editing Day {day}
+          Focus: {focus.label}
         </span>
       </div>
       <button
@@ -1060,19 +1156,57 @@ function FocusBanner({ day, onCancel }: { day: number; onCancel: () => void }) {
   );
 }
 
+class OpenUIErrorBoundary extends React.Component<
+  { code: string; children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidUpdate(previousProps: { code: string }) {
+    if (previousProps.code !== this.props.code && this.state.error) {
+      this.setState({ error: null });
+    }
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("[VoyagerLab] OpenUI renderer crashed", {
+      error,
+      componentStack: info.componentStack,
+      openUI: this.props.code,
+    });
+    postClientLog({
+      type: "openui_renderer_crash",
+      error: serializeError(error),
+      componentStack: info.componentStack,
+      openUI: this.props.code,
+    });
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+
+    return (
+      <div className="mt-2 rounded-2xl border px-4 py-3 text-sm" style={{ background: RED_LIGHT, borderColor: RED_BORDER, color: RED }}>
+        <div className="font-bold">Interactive widget could not be rendered.</div>
+        <div className="mt-1 text-xs opacity-80">The chat answer is still available. The malformed OpenUI block was logged for debugging.</div>
+      </div>
+    );
+  }
+}
+
 function ChatMessageRow({
   message,
   isStreaming,
   onOpenUIAction,
-  onTripPatch,
 }: {
   message: Message;
   isStreaming?: boolean;
   onOpenUIAction: (event: ActionEvent) => void;
-  onTripPatch: (patch: TripPatch, messageId: string) => void;
 }) {
-  const lastPatchSignature = useRef<string>("");
-
   if (message.sender === "user") {
     return (
       <div className="mb-4 flex items-end justify-end gap-2">
@@ -1083,16 +1217,6 @@ function ChatMessageRow({
       </div>
     );
   }
-
-  const handleParseResult = (result: ParseResult | null) => {
-    const patches = collectStateUpdatePatches(result?.root ?? null);
-    if (!patches.length) return;
-    const patch = combineTripPatches(patches);
-    const signature = JSON.stringify(patch);
-    if (!signature || signature === lastPatchSignature.current) return;
-    lastPatchSignature.current = signature;
-    onTripPatch(patch, message.id);
-  };
 
   return (
     <div className="mb-5 flex w-full flex-col">
@@ -1110,16 +1234,30 @@ function ChatMessageRow({
       )}
       {message.openUI && (
         <div className={`${message.text.trim() ? "ml-9" : ""} mt-1 max-w-[92%]`}>
-          <Renderer
-            response={message.openUI}
-            library={travelOpenUILibrary}
-            isStreaming={isStreaming}
-            onAction={onOpenUIAction}
-            onParseResult={handleParseResult}
-            onError={(errors: OpenUIError[]) => {
-              if (errors.length) console.warn("[VoyagerLab] OpenUI render errors", errors);
-            }}
-          />
+          <OpenUIErrorBoundary code={message.openUI}>
+            <Renderer
+              response={message.openUI}
+              library={travelOpenUILibrary}
+              isStreaming={isStreaming}
+              onAction={onOpenUIAction}
+              onError={(errors: OpenUIError[]) => {
+                if (errors.length) {
+                  console.warn("[VoyagerLab] OpenUI render errors", errors, message.openUI);
+                  postClientLog({
+                    type: "openui_render_errors",
+                    messageId: message.id,
+                    errors,
+                    openUI: message.openUI,
+                  });
+                }
+              }}
+            />
+          </OpenUIErrorBoundary>
+        </div>
+      )}
+      {message.openUIError && (
+        <div className={`${message.text.trim() ? "ml-9" : ""} mt-1 max-w-[92%] rounded-2xl border px-4 py-3 text-xs`} style={{ background: RED_LIGHT, borderColor: RED_BORDER, color: RED }}>
+          {message.openUIError}
         </div>
       )}
     </div>
@@ -1148,6 +1286,7 @@ function ChatInputBar({ onSend, disabled }: { onSend: (message: string) => void;
             if (textareaRef.current) {
               textareaRef.current.style.height = "auto";
               textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 72)}px`;
+              textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
             }
           }}
           onKeyDown={(event) => {
@@ -1158,7 +1297,7 @@ function ChatInputBar({ onSend, disabled }: { onSend: (message: string) => void;
           }}
           disabled={disabled}
           placeholder={disabled ? "AI is typing..." : "Type a message..."}
-          className="flex-1 resize-none bg-transparent py-1 text-sm text-gray-700 outline-none"
+          className="flex-1 resize-none overflow-y-auto bg-transparent py-1 text-sm text-gray-700 outline-none"
           style={{ minHeight: 28, maxHeight: 72 }}
           rows={1}
         />
@@ -1221,12 +1360,12 @@ function MetricsGrid({ trip }: { trip: TripState }) {
 
 function ItineraryArtifact({
   trip,
-  focusDay,
+  focus,
   onSetFocus,
 }: {
   trip: TripState;
-  focusDay: number | null;
-  onSetFocus: (day: number) => void;
+  focus: FocusTarget | null;
+  onSetFocus: (focus: FocusTarget) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
 
@@ -1260,19 +1399,20 @@ function ItineraryArtifact({
       {trip.days.map((day) => {
         const isOpen = expanded === day.day;
         const dayCost = computeDayCost(day);
+        const isDayFocused = focus?.day === day.day;
         return (
           <div
             key={day.day}
             className="overflow-hidden rounded-2xl border bg-white shadow-sm transition-all"
-            style={{ borderWidth: focusDay === day.day ? 2 : 1, borderColor: focusDay === day.day ? T : day.warning ? RED_BORDER : "#E2E8F0" }}
+            style={{ borderWidth: isDayFocused ? 2 : 1, borderColor: isDayFocused ? T : day.warning ? RED_BORDER : "#E2E8F0" }}
           >
             <button
               onClick={() => setExpanded(isOpen ? null : day.day)}
               className="flex w-full cursor-pointer items-center justify-between gap-3 px-4 py-3 text-left hover:bg-slate-50"
-              style={{ background: focusDay === day.day ? T_LIGHT : "white" }}
+              style={{ background: isDayFocused ? T_LIGHT : "white" }}
             >
               <div className="min-w-0">
-                <div className="truncate text-sm font-semibold" style={{ color: day.warning ? RED : focusDay === day.day ? T : "#374151" }}>
+                <div className="truncate text-sm font-semibold" style={{ color: day.warning ? RED : isDayFocused ? T : "#374151" }}>
                   Day {day.day}: {day.title}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-gray-400">
@@ -1298,8 +1438,15 @@ function ItineraryArtifact({
                           <Hotel className="h-3.5 w-3.5" />
                           {day.hotel.name}
                         </div>
-                        <div>
-                          {[day.hotel.tier, day.hotel.city, formatMoney(day.hotel.pricePerNight, trip.currency)].filter(Boolean).join(" - ")}
+                        <div className="flex items-center justify-between gap-2">
+                          <span>{[day.hotel.tier, day.hotel.city, formatMoney(day.hotel.pricePerNight, trip.currency)].filter(Boolean).join(" - ")}</span>
+                          <button
+                            onClick={() => onSetFocus({ type: "hotel", day: day.day, label: `Editing Day ${day.day} hotel` })}
+                            className="rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
+                            style={{ borderColor: T_BORDER, color: T }}
+                          >
+                            Edit
+                          </button>
                         </div>
                       </div>
                     )}
@@ -1315,6 +1462,21 @@ function ItineraryArtifact({
                         {activity.note && <div className="text-xs text-gray-400">{activity.note}</div>}
                       </div>
                       {typeof activity.cost === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(activity.cost, trip.currency)}</span>}
+                      <button
+                        onClick={() =>
+                          onSetFocus({
+                            type: "activity",
+                            day: day.day,
+                            activityIndex: index,
+                            activityName: activity.name,
+                            label: `Editing Day ${day.day} activity: ${activity.name}`,
+                          })
+                        }
+                        className="flex-shrink-0 rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
+                        style={{ borderColor: T_BORDER, color: T }}
+                      >
+                        Edit
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -1323,13 +1485,13 @@ function ItineraryArtifact({
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
-                      onSetFocus(day.day);
+                      onSetFocus({ type: "day", day: day.day, label: `Editing Day ${day.day}` });
                     }}
                     className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors"
-                    style={focusDay === day.day ? { background: T, color: "white" } : { border: `1.5px solid ${T}`, color: T, background: "white" }}
+                    style={focus?.type === "day" && focus.day === day.day ? { background: T, color: "white" } : { border: `1.5px solid ${T}`, color: T, background: "white" }}
                   >
                     <Pencil className="h-3.5 w-3.5" />
-                    {focusDay === day.day ? "Currently editing" : "Edit this day"}
+                    {focus?.type === "day" && focus.day === day.day ? "Currently editing" : "Edit this day"}
                   </button>
                 </div>
               </div>
@@ -1375,6 +1537,51 @@ function PreferencesSection({ trip }: { trip: TripState }) {
 }
 
 // --- Main app ----------------------------------------------------------------
+class AppErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("[VoyagerLab] App crashed", error, info.componentStack);
+    postClientLog({
+      type: "app_error_boundary",
+      error: serializeError(error),
+      componentStack: info.componentStack,
+    });
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-100 px-6" style={{ fontFamily: "'Inter', sans-serif" }}>
+        <div className="max-w-lg rounded-2xl border bg-white p-6 shadow-xl" style={{ borderColor: RED_BORDER }}>
+          <div className="mb-2 flex items-center gap-2 text-sm font-bold" style={{ color: RED }}>
+            <AlertTriangle className="h-4 w-4" />
+            Application error captured
+          </div>
+          <p className="text-sm leading-relaxed text-slate-600">
+            The session UI hit an unexpected error. The details were sent to the Vite terminal log.
+          </p>
+          <button
+            className="mt-4 rounded-xl px-4 py-2 text-sm font-bold text-white"
+            style={{ background: T }}
+            onClick={() => this.setState({ error: null })}
+          >
+            Try to recover
+          </button>
+        </div>
+      </div>
+    );
+  }
+}
+
 export default function App() {
   const [sessionActive, setSessionActive] = useState(false);
   const [state, setState] = useState<S>({
@@ -1382,7 +1589,7 @@ export default function App() {
     participantId: "",
     researcher: "",
     trip: emptyTripState(),
-    focusDay: null,
+    focus: null,
   });
 
   const updateState: StateUpdater = (update) => {
@@ -1393,23 +1600,51 @@ export default function App() {
     updateState((previous) => ({
       ...previous,
       trip: emptyTripState(),
-      focusDay: null,
+      focus: null,
     }));
     setSessionActive(false);
   };
 
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      postClientLog({
+        type: "window_error",
+        message: event.message,
+        source: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        error: serializeError(event.error),
+      });
+    };
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      postClientLog({
+        type: "unhandled_rejection",
+        reason: serializeError(event.reason),
+      });
+    };
+
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+    };
+  }, []);
+
   return (
-    <div className="flex h-screen flex-col overflow-hidden" style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}>
-      <div className="flex-1 overflow-hidden">
-        {!sessionActive ? (
-          <SetupScreen state={state} update={updateState} onLaunch={() => setSessionActive(true)} />
-        ) : state.condition === "A" ? (
-          <ConditionAScreen state={state} onEndSession={resetSession} />
-        ) : (
-          <ConditionBScreen state={state} updateState={updateState} onEndSession={resetSession} />
-        )}
+    <AppErrorBoundary>
+      <div className="flex h-screen flex-col overflow-hidden" style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}>
+        <div className="flex-1 overflow-hidden">
+          {!sessionActive ? (
+            <SetupScreen state={state} update={updateState} onLaunch={() => setSessionActive(true)} />
+          ) : state.condition === "A" ? (
+            <ConditionAScreen state={state} onEndSession={resetSession} />
+          ) : (
+            <ConditionBScreen state={state} updateState={updateState} onEndSession={resetSession} />
+          )}
+        </div>
       </div>
-    </div>
+    </AppErrorBoundary>
   );
 }
 
@@ -1472,6 +1707,11 @@ function SetupScreen({ state, update, onLaunch }: { state: S; update: StateUpdat
             <p className="mt-1 text-sm text-gray-500">Select the condition to activate for this participant session.</p>
           </div>
           <div className="space-y-4 px-8 py-6">
+            {validationError && (
+              <div className="rounded-2xl border px-4 py-3 text-sm font-semibold" style={{ background: RED_LIGHT, borderColor: RED_BORDER, color: RED }}>
+                Participant ID and Researcher are required before launching a session.
+              </div>
+            )}
             {(["A", "B"] as const).map((condition) => (
               <label
                 key={condition}
@@ -1572,20 +1812,43 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
     messagesRef.current = [...newHistory, aiPlaceholder];
     setMessages(messagesRef.current);
 
-    const rawResponse = await callGeminiAPIStream(newHistory, "A", state, (chunk) => {
-      setMessages((previous) => {
-        const updated = previous.map((message) => {
-          if (message.id !== aiMsgId) return message;
-          const rawText = message.rawText + chunk;
-          return { ...message, text: rawText, rawText, wordCount: countWords(rawText) };
+    try {
+      const rawResponse = await callGeminiAPIStream(newHistory, "A", state, (chunk) => {
+        setMessages((previous) => {
+          const updated = previous.map((message) => {
+            if (message.id !== aiMsgId) return message;
+            const rawText = message.rawText + chunk;
+            return { ...message, text: rawText, rawText, wordCount: countWords(rawText) };
+          });
+          messagesRef.current = updated;
+          return updated;
         });
+      }, eventsRef);
+
+      appendEvent(eventsRef, {
+        type: "chat_ai",
+        role: "ai",
+        messageId: aiMsgId,
+        content: rawResponse,
+        wordCount: countWords(rawResponse),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown chat error";
+      console.error("[VoyagerLab] Condition A send failed", error);
+      postClientLog({ type: "condition_a_send_failed", error: serializeError(error) });
+      appendEvent(eventsRef, { type: "api_error", role: "system", messageId: aiMsgId, content: message });
+      setMessages((previous) => {
+        const updated = previous.map((item) =>
+          item.id === aiMsgId
+            ? { ...item, text: `System error: ${message}`, rawText: `System error: ${message}`, wordCount: countWords(message) }
+            : item,
+        );
         messagesRef.current = updated;
         return updated;
       });
-    }, eventsRef);
-
-    appendEvent(eventsRef, { type: "chat_ai", role: "ai", messageId: aiMsgId, content: rawResponse, wordCount: countWords(rawResponse) });
-    setIsLoading(false);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleEndSession = () => {
@@ -1613,7 +1876,7 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
           </div>
         )}
         {messages.map((message) => (
-          <ChatMessageRow key={message.id} message={message} isStreaming={isLoading && message.id === messages[messages.length - 1]?.id} onOpenUIAction={() => undefined} onTripPatch={() => undefined} />
+          <ChatMessageRow key={message.id} message={message} isStreaming={isLoading && message.id === messages[messages.length - 1]?.id} onOpenUIAction={() => undefined} />
         ))}
         <div ref={endRef} />
       </div>
@@ -1653,12 +1916,12 @@ function ConditionBScreen({
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, state.focusDay]);
+  }, [messages, state.focus]);
 
   const applyOpenUITripPatch = (patch: TripPatch, messageId: string) => {
     updateState((previous) => ({
       ...previous,
-      trip: applyTripPatch(previous.trip, patch, previous.focusDay),
+      trip: applyTripPatch(previous.trip, patch, previous.focus),
     }));
     appendEvent(eventsRef, {
       type: "state_update",
@@ -1690,27 +1953,121 @@ function ConditionBScreen({
     messagesRef.current = [...newHistory, aiPlaceholder];
     setMessages(messagesRef.current);
 
-    const rawResponse = await callGeminiAPIStream(newHistory, "B", stateRef.current, (chunk) => {
-      setMessages((previous) => {
-        const updated = previous.map((message) => {
-          if (message.id !== aiMsgId) return message;
-          const rawText = message.rawText + chunk;
-          const parsed = splitAssistantResponse(rawText);
-          return {
-            ...message,
-            rawText,
-            text: parsed.text,
-            openUI: parsed.openUI ?? message.openUI,
-            wordCount: countWords(parsed.text),
-          };
+    try {
+      const rawResponse = await callGeminiAPIStream(newHistory, "B", stateRef.current, (chunk) => {
+        setMessages((previous) => {
+          const updated = previous.map((message) => {
+            if (message.id !== aiMsgId) return message;
+            const rawText = message.rawText + chunk;
+            const parsed = splitAssistantResponse(rawText);
+            return {
+              ...message,
+              rawText,
+              text: parsed.text,
+              wordCount: countWords(parsed.text),
+            };
+          });
+          messagesRef.current = updated;
+          return updated;
         });
+      }, eventsRef);
+
+      const finalParsed = splitAssistantResponse(rawResponse);
+      const finalOpenUI = finalParsed.openUI;
+      let renderableOpenUI: string | undefined;
+      let openUIError: string | undefined;
+      let patchToApply: TripPatch | undefined;
+
+      if (finalOpenUI) {
+        const { patch, errors } = parseTripPatchFromOpenUI(finalOpenUI);
+        if (errors.length) {
+          openUIError = "Interactive widget skipped because Gemini returned malformed OpenUI.";
+          console.warn("[VoyagerLab] OpenUI parse errors after final Gemini response", errors, finalOpenUI);
+          postClientLog({
+            type: "openui_parse_error",
+            messageId: aiMsgId,
+            errors,
+            openUI: finalOpenUI,
+          });
+          appendEvent(eventsRef, {
+            type: "api_error",
+            role: "system",
+            messageId: aiMsgId,
+            content: "OpenUI parse errors after final Gemini response",
+            metadata: { errors, openUI: finalOpenUI },
+          });
+        } else {
+          renderableOpenUI = finalOpenUI;
+          patchToApply = patch;
+        }
+      } else if (finalParsed.malformedOpenUI) {
+        openUIError = "Interactive widget skipped because Gemini did not finish the OpenUI block.";
+        console.warn("[VoyagerLab] Incomplete OpenUI block skipped", finalParsed.malformedOpenUI);
+        postClientLog({
+          type: "openui_incomplete_block",
+          messageId: aiMsgId,
+          openUI: finalParsed.malformedOpenUI,
+        });
+        appendEvent(eventsRef, {
+          type: "api_error",
+          role: "system",
+          messageId: aiMsgId,
+          content: "Incomplete OpenUI block skipped",
+          metadata: { openUI: finalParsed.malformedOpenUI },
+        });
+      }
+
+      setMessages((previous) => {
+        const updated = previous.map((message) =>
+          message.id === aiMsgId
+            ? {
+                ...message,
+                rawText: rawResponse,
+                text: finalParsed.text || message.text,
+                openUI: renderableOpenUI,
+                openUIError,
+                wordCount: countWords(finalParsed.text || message.text),
+              }
+            : message,
+        );
         messagesRef.current = updated;
         return updated;
       });
-    }, eventsRef);
 
-    appendEvent(eventsRef, { type: "chat_ai", role: "ai", messageId: aiMsgId, content: rawResponse, wordCount: countWords(rawResponse) });
-    setIsLoading(false);
+      if (patchToApply) {
+        applyOpenUITripPatch(patchToApply, aiMsgId);
+        postClientLog({
+          type: "state_patch_applied",
+          messageId: aiMsgId,
+          patch: patchToApply,
+        });
+      }
+
+      appendEvent(eventsRef, {
+        type: "chat_ai",
+        role: "ai",
+        messageId: aiMsgId,
+        content: rawResponse,
+        wordCount: countWords(rawResponse),
+        metadata: { openUI: finalOpenUI ?? null, openUIError: openUIError ?? null },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown chat error";
+      console.error("[VoyagerLab] Condition B send failed", error);
+      postClientLog({ type: "condition_b_send_failed", error: serializeError(error) });
+      appendEvent(eventsRef, { type: "api_error", role: "system", messageId: aiMsgId, content: message });
+      setMessages((previous) => {
+        const updated = previous.map((item) =>
+          item.id === aiMsgId
+            ? { ...item, text: `System error: ${message}`, rawText: `System error: ${message}`, wordCount: countWords(message) }
+            : item,
+        );
+        messagesRef.current = updated;
+        return updated;
+      });
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleOpenUIAction = (event: ActionEvent) => {
@@ -1734,20 +2091,20 @@ function ConditionBScreen({
     void handleSend(message, "ui_action");
   };
 
-  const setEditFocus = (day: number) => {
-    updateState({ focusDay: day });
+  const setEditFocus = (focus: FocusTarget) => {
+    updateState({ focus });
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
       source: "itinerary_focus",
-      content: `Focus editing Day ${day}`,
-      metadata: { day },
+      content: `Focus ${focus.label}`,
+      metadata: focus,
     });
   };
 
   const cancelFocus = () => {
-    const previousFocus = stateRef.current.focusDay;
-    updateState({ focusDay: null });
+    const previousFocus = stateRef.current.focus;
+    updateState({ focus: null });
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
@@ -1775,7 +2132,7 @@ function ConditionBScreen({
     <div className="grid h-full w-full bg-slate-50" style={{ gridTemplateColumns: "minmax(320px, 1fr) minmax(0, 2fr)" }}>
       <div className="relative z-10 flex min-w-0 flex-col border-r border-gray-200 bg-white shadow-xl">
         <ChatHeader onEndSession={handleEndSession} />
-        {state.focusDay && <FocusBanner day={state.focusDay} onCancel={cancelFocus} />}
+        {state.focus && <FocusBanner focus={state.focus} onCancel={cancelFocus} />}
         <div className="flex flex-1 flex-col overflow-y-auto px-5 pb-2 pt-5">
           {messages.length === 0 && (
             <div className="mt-auto rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 text-center" style={{ background: "#FAFAFA" }}>
@@ -1793,7 +2150,6 @@ function ConditionBScreen({
               message={message}
               isStreaming={isLoading && message.id === lastMessageId}
               onOpenUIAction={handleOpenUIAction}
-              onTripPatch={applyOpenUITripPatch}
             />
           ))}
           <div ref={endRef} />
@@ -1804,7 +2160,7 @@ function ConditionBScreen({
       <div className="flex min-w-0 flex-col">
         <MetricsGrid trip={state.trip} />
         <div className="relative flex-1 overflow-y-auto px-8">
-          <ItineraryArtifact trip={state.trip} focusDay={state.focusDay} onSetFocus={setEditFocus} />
+          <ItineraryArtifact trip={state.trip} focus={state.focus} onSetFocus={setEditFocus} />
         </div>
         <PreferencesSection trip={state.trip} />
       </div>
