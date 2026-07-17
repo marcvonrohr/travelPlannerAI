@@ -3,6 +3,10 @@
 
 # IDEs and editors
 /.idea
+/docs_master_thesis
+/figma_draft_final
+/openui-main
+/.agents
 .project
 .classpath
 .c9/
