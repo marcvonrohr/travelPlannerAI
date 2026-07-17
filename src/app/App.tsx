@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Download,
   FlaskConical,
   Hotel,
   Map as MapIcon,
@@ -68,6 +69,7 @@ type UserPreference = {
 
 type Activity = {
   time: string;
+  endTime?: string;
   name: string;
   note?: string;
   cost?: number;
@@ -86,10 +88,12 @@ type DayPlan = {
   day: number;
   title: string;
   city?: string;
+  location?: string;
   summary?: string;
   hotel?: HotelStay | null;
   spend?: number;
   warning?: boolean;
+  completed?: boolean;
   activities: Activity[];
 };
 
@@ -182,6 +186,7 @@ const PreferenceSchema = z.object({
 
 const ActivitySchema = z.object({
   time: z.string(),
+  endTime: z.string().optional(),
   name: z.string(),
   note: z.string().optional(),
   cost: z.number().optional(),
@@ -200,10 +205,12 @@ const DayPlanSchema = z.object({
   day: z.number(),
   title: z.string(),
   city: z.string().optional(),
+  location: z.string().optional(),
   summary: z.string().optional(),
   hotel: HotelStaySchema.nullable().optional(),
   spend: z.number().optional(),
   warning: z.boolean().optional(),
+  completed: z.boolean().optional(),
   activities: z.array(ActivitySchema),
 });
 
@@ -263,7 +270,7 @@ const HotelOptionsComponent = defineComponent({
               <button
                 key={`${option.tier}-${option.name ?? "option"}`}
                 disabled={isStreaming}
-                onClick={() => triggerAction(`I choose ${label}.`)}
+                onClick={() => triggerAction(`I choose ${label}${price ? ` at about ${price} per night` : ""}.`)}
                 className="min-h-[112px] rounded-xl border bg-white px-3 py-3 text-left transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                 style={{ borderColor: T_BORDER }}
               >
@@ -277,6 +284,95 @@ const HotelOptionsComponent = defineComponent({
               </button>
             );
           })}
+        </div>
+      </div>
+    );
+  },
+});
+
+const QuickPreferencesComponent = defineComponent({
+  name: "QuickPreferences",
+  description:
+    "Compact preference widget for dietary needs and accommodation tier or nightly budget range. Use only after asking a relevant preference question.",
+  props: z.object({
+    title: z.string().optional(),
+    dietary: z.array(z.object({ label: z.string(), selected: z.boolean().optional() })).optional(),
+    accommodationTiers: z.array(z.string()).optional(),
+    selectedTier: z.string().optional(),
+    minPrice: z.number().optional(),
+    maxPrice: z.number().optional(),
+    selectedPrice: z.number().optional(),
+    currency: z.string().optional(),
+  }),
+  component: ({ props }) => {
+    const triggerAction = useTriggerAction();
+    const isStreaming = useIsStreaming();
+    const dietary = props.dietary?.length ? props.dietary : [
+      { label: "Gluten-free" },
+      { label: "Vegan" },
+      { label: "Halal" },
+      { label: "Nut-free" },
+    ];
+    const tiers = props.accommodationTiers?.length ? props.accommodationTiers : ["Hostel", "3-Star", "Luxury"];
+    const currency = props.currency || "CHF";
+
+    return (
+      <div className="mt-2 w-full rounded-2xl border border-dashed bg-white shadow-sm" style={{ borderColor: T_BORDER }}>
+        <div className="flex items-center justify-between border-b px-4 py-2" style={{ borderColor: T_BORDER, background: T_LIGHT }}>
+          <div className="text-[10px] font-bold uppercase tracking-widest text-gray-500">{props.title || "Quick Preferences"}</div>
+          <div className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest" style={{ color: T }}>
+            <Zap className="h-3 w-3" />
+            AI-generated
+          </div>
+        </div>
+        <div className="grid gap-4 p-4 sm:grid-cols-2">
+          <div>
+            <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Dietary</div>
+            <div className="grid grid-cols-2 gap-2">
+              {dietary.map((item) => (
+                <button
+                  key={item.label}
+                  disabled={isStreaming}
+                  onClick={() => triggerAction(`${item.selected ? "Remove" : "Add"} dietary preference: ${item.label}.`)}
+                  className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <span className="flex h-4 w-4 items-center justify-center rounded border" style={{ background: item.selected ? T : "white", borderColor: item.selected ? T : "#CBD5E1" }}>
+                    {item.selected && <Check className="h-3 w-3 text-white" />}
+                  </span>
+                  <span className="text-slate-700">{item.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Accommodation</div>
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {tiers.map((tier) => {
+                const selected = tier === props.selectedTier;
+                return (
+                  <button
+                    key={tier}
+                    disabled={isStreaming}
+                    onClick={() => triggerAction(`I prefer ${tier} accommodation.`)}
+                    className="rounded-lg border px-2.5 py-1 text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    style={{ background: selected ? T : "white", borderColor: selected ? T : T_BORDER, color: selected ? "white" : "#475569" }}
+                  >
+                    {tier}
+                  </button>
+                );
+              })}
+            </div>
+            {(props.minPrice || props.maxPrice || props.selectedPrice) && (
+              <button
+                disabled={isStreaming}
+                onClick={() => triggerAction(`My accommodation budget is about ${props.selectedPrice ?? props.maxPrice ?? props.minPrice} ${currency} per night.`)}
+                className="w-full rounded-lg border bg-white px-3 py-2 text-left text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                style={{ borderColor: T_BORDER, color: T }}
+              >
+                ~{props.minPrice ?? 0}-{props.maxPrice ?? props.selectedPrice ?? 0} {currency}/night
+              </button>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -417,6 +513,7 @@ const TravelUIComponent = defineComponent({
       z.union([
         StateUpdateComponent.ref,
         HotelOptionsComponent.ref,
+        QuickPreferencesComponent.ref,
         ConflictWarningComponent.ref,
         SuggestionChipsComponent.ref,
         PreferenceOptionsComponent.ref,
@@ -434,6 +531,7 @@ const travelOpenUILibrary = createLibrary({
     TravelUIComponent,
     StateUpdateComponent,
     HotelOptionsComponent,
+    QuickPreferencesComponent,
     ConflictWarningComponent,
     SuggestionChipsComponent,
     PreferenceOptionsComponent,
@@ -449,7 +547,7 @@ const travelOpenUILibrary = createLibrary({
     },
     {
       name: "Interactive Widgets",
-      components: ["HotelOptions", "ConflictWarning", "SuggestionChips", "PreferenceOptions"],
+      components: ["HotelOptions", "QuickPreferences", "ConflictWarning", "SuggestionChips", "PreferenceOptions"],
       notes: [
         "- Use widgets as standalone blocks below your natural-language answer.",
         "- Every visible widget should help the user make a concrete planning decision.",
@@ -475,7 +573,16 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "For inputs such as \"I need gluten-free food and want Japan\", capture both destination and dietary preference in StateUpdate, then ask one missing basic such as duration, travelers, or budget.",
     "Use HotelOptions only after you have first elicited lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.",
     "Do not draft a full sightseeing itinerary until sightseeing priorities and preferred pace are known or strongly implied.",
+    "During the first 2-3 assistant turns, default to text-only unless a single compact widget is clearly necessary.",
+    "If the user asks for something that conflicts with an active constraint, do not silently rewrite the constraint. Use ConflictWarning and ask the user to resolve it.",
+    "Generic conflict patterns: requested destination conflicts with an excluded region; a new dietary need conflicts with planned restaurants; a new activity exceeds budget or available time.",
+    "When adding a new constraint after an itinerary exists, review the current itinerary and surface any conflicts one at a time with ConflictWarning.",
+    "When proposing a high-level route, include StateUpdate.days so the right-side Itinerary can render. Do not put itinerary days only in prose.",
+    "For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.",
+    "When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.",
+    "Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.",
     "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
+    "Use QuickPreferences only after asking a relevant preference question about dietary needs or accommodation needs.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
@@ -500,6 +607,15 @@ Behavior rules:
 - Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.
 - Use HotelOptions only after first eliciting lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.
 - Do not draft a full sightseeing itinerary until sightseeing priorities and preferred pace are known or strongly implied.
+- During the first 2-3 assistant turns, default to text-only unless a single compact widget is clearly necessary.
+- If the user asks for something that conflicts with an active constraint, do not silently rewrite the constraint. Use ConflictWarning and ask the user to resolve it.
+- Generic conflict patterns: requested destination conflicts with an excluded region; a new dietary need conflicts with planned restaurants; a new activity exceeds budget or available time.
+- When adding a new constraint after an itinerary exists, review the current itinerary and surface any conflicts one at a time with ConflictWarning.
+- When proposing a high-level route, include StateUpdate.days so the right-side Itinerary can render. Do not put itinerary days only in prose.
+- For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.
+- When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.
+- Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.
+- Use QuickPreferences only after asking a relevant preference question about dietary needs or accommodation needs.
 - When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
@@ -618,6 +734,64 @@ const generateCSVAndDownload = (
   document.body.removeChild(link);
 };
 
+const generateTripCSVAndDownload = (state: S) => {
+  const metrics = computeTripMetrics(state.trip);
+  const fallbackNightlyCost = extractNightlyCostFromPreferences(state.trip.preferences);
+  let csvContent =
+    "ParticipantID,Researcher,Condition,ExportedAt,MetricTotalCost,MetricSatisfiedPrefs,MetricCapturedPrefs,MetricConflicts,MetricCompletedDays,MetricDraftedDays,PreferenceLabel,PreferenceValue,PreferenceCategory,PreferenceStatus,Day,Completed,Title,Location,HotelName,HotelTier,HotelCost,DayCost,Warning,ActivityStart,ActivityEnd,ActivityName,ActivityCost,ActivityNote,FinalTripState\n";
+
+  const preferences = state.trip.preferences.length ? state.trip.preferences : [{ label: "", value: "", category: "", status: "" } as UserPreference];
+  const days = state.trip.days.length ? state.trip.days : [{ day: 0, title: "", activities: [] } as DayPlan];
+
+  for (const pref of preferences) {
+    for (const day of days) {
+      const activities = day.activities.length ? day.activities : [{ time: "", name: "" } as Activity];
+      for (const activity of activities) {
+        const row = [
+          state.participantId,
+          state.researcher,
+          state.condition,
+          getTimestamp(),
+          metrics.totalCost,
+          metrics.satisfiedPrefs,
+          metrics.capturedPrefs,
+          metrics.conflicts,
+          metrics.daysPlanned,
+          metrics.draftedDays,
+          pref.label,
+          pref.value ?? "",
+          pref.category ?? "",
+          pref.status ?? "",
+          day.day || "",
+          day.completed ? "yes" : "no",
+          day.title,
+          day.location || day.city || "",
+          day.hotel?.name ?? "",
+          day.hotel?.tier ?? "",
+          getDayHotelCost(day, fallbackNightlyCost),
+          computeDayCost(day, fallbackNightlyCost),
+          day.warning ? "yes" : "no",
+          activity.time,
+          activity.endTime ?? "",
+          activity.name,
+          activity.cost ?? "",
+          activity.note ?? "",
+          state.trip,
+        ].map(escapeCSV);
+        csvContent += `${row.join(",")}\n`;
+      }
+    }
+  }
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const link = document.createElement("a");
+  link.setAttribute("href", URL.createObjectURL(blob));
+  link.setAttribute("download", `VoyagerLab_Trip_${state.participantId || "unknown"}_${Date.now()}.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
 const splitAssistantResponse = (rawText: string) => {
   const closedFenceRegex = /```([a-zA-Z0-9_-]*)\s*\n([\s\S]*?)```/g;
   const codeBlocks: string[] = [];
@@ -660,25 +834,41 @@ const splitAssistantResponse = (rawText: string) => {
 
 const getMessageTextForModel = (message: Message) => message.rawText || message.text;
 
-const computeDayCost = (day: DayPlan) => {
-  if (typeof day.spend === "number" && !Number.isNaN(day.spend)) return day.spend;
+const getDayHotelCost = (day: DayPlan, fallbackNightlyCost?: number) => {
+  if (typeof day.hotel?.pricePerNight === "number" && !Number.isNaN(day.hotel.pricePerNight)) return day.hotel.pricePerNight;
+  return fallbackNightlyCost ?? 0;
+};
+
+const extractNightlyCostFromPreferences = (preferences: UserPreference[]) => {
+  const lodgingPref = preferences.find((pref) => pref.category === "lodging" && /\d/.test(`${pref.label} ${pref.value ?? ""}`));
+  const match = lodgingPref ? `${lodgingPref.label} ${lodgingPref.value ?? ""}`.match(/(\d+(?:[.,]\d+)?)/) : null;
+  return match ? Number(match[1].replace(",", ".")) : undefined;
+};
+
+const computeDayCost = (day: DayPlan, fallbackNightlyCost?: number) => {
+  const hotelCost = getDayHotelCost(day, fallbackNightlyCost);
   const activitiesCost = day.activities.reduce((sum, activity) => sum + (activity.cost ?? 0), 0);
-  return activitiesCost + (day.hotel?.pricePerNight ?? 0);
+  const explicitSpend = typeof day.spend === "number" && !Number.isNaN(day.spend) ? day.spend : undefined;
+  if (explicitSpend === undefined) return activitiesCost + hotelCost;
+  return explicitSpend >= activitiesCost + hotelCost ? explicitSpend : explicitSpend + hotelCost;
 };
 
 function computeTripMetrics(trip: TripState) {
-  const totalCost = trip.days.reduce((sum, day) => sum + computeDayCost(day), 0);
+  const fallbackNightlyCost = extractNightlyCostFromPreferences(trip.preferences);
+  const totalCost = trip.days.reduce((sum, day) => sum + computeDayCost(day, fallbackNightlyCost), 0);
   const capturedPrefs = trip.preferences.length;
   const satisfiedPrefs = trip.preferences.filter((pref) => pref.status !== "conflict").length;
   const conflicts = trip.preferences.filter((pref) => pref.status === "conflict").length + trip.days.filter((day) => day.warning).length;
   const budgetDelta = typeof trip.budget === "number" ? trip.budget - totalCost : null;
+  const completedDays = trip.days.filter((day) => day.completed).length;
 
   return {
     totalCost,
     capturedPrefs,
     satisfiedPrefs,
     conflicts,
-    daysPlanned: trip.days.length,
+    daysPlanned: completedDays,
+    draftedDays: trip.days.length,
     budgetDelta,
   };
 }
@@ -716,7 +906,7 @@ const metricCardsFromTrip = (trip: TripState) => {
     {
       label: "Days Planned",
       value: `${metrics.daysPlanned || 0}`,
-      sub: trip.durationDays ? `target: ${trip.durationDays} days` : "duration unknown",
+      sub: trip.durationDays ? `${metrics.draftedDays} drafted / target: ${trip.durationDays}` : `${metrics.draftedDays} drafted`,
       icon: <CalendarDays className="h-3.5 w-3.5 text-gray-400" />,
       red: false,
       green: trip.durationDays ? metrics.daysPlanned === trip.durationDays : metrics.daysPlanned > 0,
@@ -758,6 +948,7 @@ const coerceActivities = (value: unknown): Activity[] => {
       if (!name) return null;
       return {
         time,
+        endTime: asString(item.endTime),
         name,
         note: asString(item.note),
         cost: asNumber(item.cost),
@@ -793,10 +984,12 @@ const coerceDays = (value: unknown): DayPlan[] | undefined => {
         day,
         title,
         city: asString(item.city),
+        location: asString(item.location),
         summary: asString(item.summary),
         hotel: coerceHotel(item.hotel),
         spend: asNumber(item.spend),
         warning: asBoolean(item.warning),
+        completed: asBoolean(item.completed),
         activities: coerceActivities(item.activities),
       };
     })
@@ -899,19 +1092,24 @@ const parseTripPatchFromOpenUI = (openUI: string | undefined) => {
   }
 };
 
-const mergePreferences = (_existing: UserPreference[], incoming?: UserPreference[]) => {
+const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[]) => {
   if (!incoming) return existing;
   return incoming;
 };
+
+const mergeDayPreservingLocalState = (existing: DayPlan | undefined, incoming: DayPlan): DayPlan => ({
+  ...incoming,
+  completed: incoming.completed ?? existing?.completed ?? false,
+});
 
 const mergeDays = (existing: DayPlan[], incoming?: DayPlan[], focus?: FocusTarget | null) => {
   if (!incoming) return existing;
   if (focus && existing.length) {
     const incomingFocusDay = incoming.find((day) => day.day === focus.day);
     if (!incomingFocusDay) return existing;
-    return existing.map((day) => (day.day === focus.day ? incomingFocusDay : day));
+    return existing.map((day) => (day.day === focus.day ? mergeDayPreservingLocalState(day, incomingFocusDay) : day));
   }
-  return incoming;
+  return incoming.map((day) => mergeDayPreservingLocalState(existing.find((existingDay) => existingDay.day === day.day), day));
 };
 
 const applyTripPatch = (trip: TripState, patch: TripPatch, focus?: FocusTarget | null): TripState => ({
@@ -1311,17 +1509,29 @@ function ChatInputBar({ onSend, disabled }: { onSend: (message: string) => void;
 }
 
 // --- Right panel --------------------------------------------------------------
-function MetricsGrid({ trip }: { trip: TripState }) {
+function MetricsGrid({ trip, onExportTrip }: { trip: TripState; onExportTrip?: () => void }) {
   const metrics = metricCardsFromTrip(trip);
 
   return (
     <div className="flex-shrink-0 border-b border-gray-200" style={{ background: METRICS_BG }}>
       <div className="px-6 py-4">
-        <div className="mb-3 flex items-center gap-2">
-          <TrendingUp className="h-4 w-4" style={{ color: T }} />
-          <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color: T }}>
-            Live Trip Performance
-          </span>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="h-4 w-4" style={{ color: T }} />
+            <span className="text-[10px] font-bold uppercase tracking-widest" style={{ color: T }}>
+              Live Trip Performance
+            </span>
+          </div>
+          {onExportTrip && (
+            <button
+              onClick={onExportTrip}
+              className="flex items-center gap-1.5 rounded-lg border bg-white px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
+              style={{ borderColor: T_BORDER, color: T }}
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export Trip CSV
+            </button>
+          )}
         </div>
         <div className="grid grid-cols-3 gap-3">
           {metrics.map((metric) => (
@@ -1358,10 +1568,12 @@ function ItineraryArtifact({
   trip,
   focus,
   onSetFocus,
+  onToggleDayComplete,
 }: {
   trip: TripState;
   focus: FocusTarget | null;
   onSetFocus: (focus: FocusTarget) => void;
+  onToggleDayComplete: (day: number) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
 
@@ -1394,8 +1606,11 @@ function ItineraryArtifact({
 
       {trip.days.map((day) => {
         const isOpen = expanded === day.day;
-        const dayCost = computeDayCost(day);
+        const fallbackNightlyCost = extractNightlyCostFromPreferences(trip.preferences);
+        const dayCost = computeDayCost(day, fallbackNightlyCost);
         const isDayFocused = focus?.day === day.day;
+        const locationLabel = day.location || day.city || trip.destination;
+        const hotelLabel = day.hotel?.name || (fallbackNightlyCost ? "Selected accommodation" : "");
         return (
           <div
             key={day.day}
@@ -1412,12 +1627,15 @@ function ItineraryArtifact({
                   Day {day.day}: {day.title}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-gray-400">
-                  {day.city ? `${day.city} - ` : ""}
+                  {locationLabel ? `${locationLabel} - ` : ""}
                   {day.activities.length} activities
-                  {day.hotel?.name ? ` - Stay: ${day.hotel.name}` : ""}
+                  {hotelLabel ? ` - Stay: ${hotelLabel}` : ""}
                 </div>
               </div>
               <div className="flex flex-shrink-0 items-center gap-3">
+                <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={day.completed ? { background: GREEN_LIGHT, color: GREEN } : { background: "#F1F5F9", color: "#94A3B8" }}>
+                  {day.completed ? "Completed" : "Draft"}
+                </span>
                 {dayCost > 0 && <span className="text-xs font-semibold" style={{ color: day.warning ? RED : T }}>{formatMoney(dayCost, trip.currency)}</span>}
                 {day.warning ? <AlertTriangle className="h-4 w-4" style={{ color: RED }} /> : isOpen ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
               </div>
@@ -1438,7 +1656,7 @@ function ItineraryArtifact({
                           <span>{[day.hotel.tier, day.hotel.city, formatMoney(day.hotel.pricePerNight, trip.currency)].filter(Boolean).join(" - ")}</span>
                           <button
                             onClick={() => onSetFocus({ type: "hotel", day: day.day, label: `Editing Day ${day.day} hotel` })}
-                            className="rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
+                            className="rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-teal-200"
                             style={{ borderColor: T_BORDER, color: T }}
                           >
                             Edit
@@ -1452,7 +1670,7 @@ function ItineraryArtifact({
                 <div className="mb-3 space-y-2">
                   {day.activities.map((activity, index) => (
                     <div key={`${activity.time}-${activity.name}-${index}`} className="flex items-start gap-3 rounded-xl bg-white px-3 py-2" style={activity.changed ? { background: GREEN_LIGHT } : undefined}>
-                      <span className="mt-0.5 w-12 flex-shrink-0 font-mono text-[10px] text-gray-400">{activity.time || "--:--"}</span>
+                      <span className="mt-0.5 w-20 flex-shrink-0 font-mono text-[10px] text-gray-400">{activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : activity.time || "--:--"}</span>
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-medium" style={{ color: activity.changed ? GREEN : "#374151" }}>{activity.name}</div>
                         {activity.note && <div className="text-xs text-gray-400">{activity.note}</div>}
@@ -1468,7 +1686,7 @@ function ItineraryArtifact({
                             label: `Editing Day ${day.day} activity: ${activity.name}`,
                           })
                         }
-                        className="flex-shrink-0 rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide"
+                        className="flex-shrink-0 rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-teal-200"
                         style={{ borderColor: T_BORDER, color: T }}
                       >
                         Edit
@@ -1477,13 +1695,24 @@ function ItineraryArtifact({
                   ))}
                 </div>
 
-                <div className="flex justify-end border-t border-gray-100 pt-2.5">
+                <div className="flex justify-end gap-2 border-t border-gray-100 pt-2.5">
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onToggleDayComplete(day.day);
+                    }}
+                    className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors hover:bg-green-50 focus:outline-none focus:ring-2 focus:ring-green-200"
+                    style={day.completed ? { background: GREEN, color: "white" } : { border: `1.5px solid ${GREEN}`, color: GREEN, background: "white" }}
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    {day.completed ? "Completed" : "Mark day complete"}
+                  </button>
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
                       onSetFocus({ type: "day", day: day.day, label: `Editing Day ${day.day}` });
                     }}
-                    className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors"
+                    className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
                     style={focus?.type === "day" && focus.day === day.day ? { background: T, color: "white" } : { border: `1.5px solid ${T}`, color: T, background: "white" }}
                   >
                     <Pencil className="h-3.5 w-3.5" />
@@ -2109,6 +2338,32 @@ function ConditionBScreen({
     });
   };
 
+  const toggleDayComplete = (dayNumber: number) => {
+    let nextCompleted = false;
+    updateState((previous) => {
+      const days = previous.trip.days.map((day) => {
+        if (day.day !== dayNumber) return day;
+        nextCompleted = !day.completed;
+        return { ...day, completed: nextCompleted };
+      });
+      return { ...previous, trip: { ...previous.trip, days } };
+    });
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "itinerary_complete",
+      content: `${nextCompleted ? "Mark complete" : "Mark incomplete"} Day ${dayNumber}`,
+      metadata: { day: dayNumber, completed: nextCompleted },
+    });
+    appendEvent(eventsRef, {
+      type: "state_update",
+      role: "system",
+      source: "itinerary_complete",
+      content: `Day ${dayNumber} completion updated`,
+      metadata: { day: dayNumber, completed: nextCompleted },
+    });
+  };
+
   const cancelFocus = () => {
     const previousFocus = stateRef.current.focus;
     updateState({ focus: null });
@@ -2131,6 +2386,17 @@ function ConditionBScreen({
     });
     generateCSVAndDownload(stateRef.current, startRef.current.str, durationSec, messagesRef.current, eventsRef.current);
     onEndSession();
+  };
+
+  const handleExportTrip = () => {
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "trip_export",
+      content: "Export trip CSV",
+      metadata: { metrics: computeTripMetrics(stateRef.current.trip), trip: stateRef.current.trip },
+    });
+    generateTripCSVAndDownload(stateRef.current);
   };
 
   const lastMessageId = messages[messages.length - 1]?.id;
@@ -2165,9 +2431,9 @@ function ConditionBScreen({
       </div>
 
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
-        <MetricsGrid trip={state.trip} />
+        <MetricsGrid trip={state.trip} onExportTrip={handleExportTrip} />
         <div className="relative min-h-0 flex-1 overflow-y-auto px-8">
-          <ItineraryArtifact trip={state.trip} focus={state.focus} onSetFocus={setEditFocus} />
+          <ItineraryArtifact trip={state.trip} focus={state.focus} onSetFocus={setEditFocus} onToggleDayComplete={toggleDayComplete} />
         </div>
         <PreferencesSection trip={state.trip} />
       </div>
