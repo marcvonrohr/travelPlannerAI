@@ -10,7 +10,7 @@ import {
   ChevronRight,
   FlaskConical,
   Hotel,
-  Map,
+  Map as MapIcon,
   Pencil,
   Play,
   Sparkles,
@@ -460,6 +460,8 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Ask at most one focused Socratic question at a time before the first route is proposed.",
     "In the first 2-3 assistant turns, keep widgets sparse. Prefer text-first Socratic questioning and use at most one small widget only if it supports the single question being asked.",
     "For vague starts like \"I want to travel\", ask one destination or region question instead of offering many predefined trip concepts.",
+    "For a pure greeting or vague opening with no concrete travel information, respond with text only. Do not output OpenUI and do not send an empty StateUpdate.",
+    "Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.",
     "For inputs such as \"I need gluten-free food and want Japan\", capture both destination and dietary preference in StateUpdate, then ask one missing basic such as duration, travelers, or budget.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
@@ -469,26 +471,6 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Use ConflictWarning when budget, time, preference, or feasibility constraints collide.",
     "Use SuggestionChips or PreferenceOptions for contextual quick replies, not generic suggestions.",
     "When a focus day is active, treat the user's request as applying only to that day and update only that day in the itinerary.",
-  ],
-  examples: [
-    `I have enough to draft the first route. Here is a compact 7-day Europe loop that stays under your current budget.
-
-\`\`\`openui-lang
-root = TravelUI([state, hotels, chips])
-state = StateUpdate("Europe", 1500, "CHF", 7, 2, [{label: "Budget", value: "1500 CHF", category: "budget", status: "captured"}, {label: "Duration", value: "7 days", category: "duration", status: "captured"}], [day1, day2], "draft")
-day1 = {day: 1, title: "Zurich arrival", city: "Zurich", summary: "Arrival, Old Town walk, relaxed dinner", hotel: {name: "Hotel Adler Zurich", tier: "3-Star", city: "Zurich", pricePerNight: 145}, spend: 245, warning: false, activities: [{time: "15:00", name: "Old Town walk", note: "Low-pressure arrival activity", cost: 0}]}
-day2 = {day: 2, title: "Paris highlights", city: "Paris", summary: "Train to Paris and classic sights", hotel: {name: "Hotel des Grands Hommes", tier: "3-Star", city: "Paris", pricePerNight: 155}, spend: 310, warning: false, activities: [{time: "09:00", name: "TGV to Paris", note: "Book early for budget control", cost: 95}]}
-hotels = HotelOptions("Accommodation direction", [{tier: "Budget", pricePerNight: 80, summary: "Hostels or simple hotels"}, {tier: "3-Star", pricePerNight: 150, summary: "Best balance for comfort and budget"}, {tier: "Boutique", pricePerNight: 230, summary: "More comfort, less budget margin"}])
-chips = SuggestionChips("Refine next", ["Make it slower paced", "Prioritize museums", "Keep hotels central"])
-\`\`\``,
-    `That helicopter idea is exciting, but it creates a budget trade-off.
-
-\`\`\`openui-lang
-root = TravelUI([state, conflict])
-state = StateUpdate("Europe", 1500, "CHF", 7, 2, [{label: "Budget", value: "1500 CHF", category: "budget", status: "conflict"}], [day3], "conflict")
-day3 = {day: 3, title: "Alpine helicopter option", city: "Interlaken", summary: "Premium scenic flight exceeds current budget", hotel: null, spend: 520, warning: true, activities: [{time: "10:00", name: "Helicopter tour", note: "Over budget unless another item is reduced", cost: 380}]}
-conflict = ConflictWarning("The helicopter tour adds about 380 CHF and pushes the plan over the 1500 CHF limit.", "budget", ["Increase budget limit", "Swap another activity", "Find a cheaper scenic alternative"])
-\`\`\``,
   ],
 });
 
@@ -501,6 +483,8 @@ Behavior rules:
 - Do not ask endless setup questions. Once destination or region, budget, duration, and travelers are known or strongly implied, propose a first route.
 - In the first 2-3 assistant turns, keep quick replies sparse and never replace the user's own reflection with a large menu of choices.
 - For vague openings, ask one focused question; for concrete constraints such as gluten-free food and Japan, capture them immediately in StateUpdate.
+- For a pure greeting or vague opening with no concrete travel information, respond with text only; do not output OpenUI and do not send an empty StateUpdate.
+- Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
 - If the user clicks an interactive widget, treat the resulting user message as an explicit choice.
@@ -901,7 +885,7 @@ const parseTripPatchFromOpenUI = (openUI: string | undefined) => {
 
 const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[]) => {
   if (!incoming) return existing;
-  const byLabel = new Map(existing.map((pref) => [normalizeTextKey(pref.label), pref]));
+  const byLabel = new globalThis.Map(existing.map((pref) => [normalizeTextKey(pref.label), pref]));
   incoming.forEach((pref) => {
     byLabel.set(normalizeTextKey(pref.label), { ...byLabel.get(normalizeTextKey(pref.label)), ...pref });
   });
@@ -1377,7 +1361,7 @@ function ItineraryArtifact({
     return (
       <div className="flex h-full flex-col items-center justify-center px-8 text-center opacity-70">
         <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full" style={{ background: T_LIGHT }}>
-          <Map className="h-7 w-7" style={{ color: T }} />
+          <MapIcon className="h-7 w-7" style={{ color: T }} />
         </div>
         <p className="max-w-sm text-sm leading-relaxed text-gray-400">
           Your AI-generated itinerary and live tracking metrics will appear here once the first route is proposed.
@@ -1582,7 +1566,7 @@ class AppErrorBoundary extends React.Component<
   }
 }
 
-export default function App() {
+function AppShell() {
   const [sessionActive, setSessionActive] = useState(false);
   const [state, setState] = useState<S>({
     condition: "B",
@@ -1632,18 +1616,24 @@ export default function App() {
   }, []);
 
   return (
-    <AppErrorBoundary>
-      <div className="flex h-screen flex-col overflow-hidden" style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}>
-        <div className="flex-1 overflow-hidden">
-          {!sessionActive ? (
-            <SetupScreen state={state} update={updateState} onLaunch={() => setSessionActive(true)} />
-          ) : state.condition === "A" ? (
-            <ConditionAScreen state={state} onEndSession={resetSession} />
-          ) : (
-            <ConditionBScreen state={state} updateState={updateState} onEndSession={resetSession} />
-          )}
-        </div>
+    <div className="flex h-screen flex-col overflow-hidden" style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}>
+      <div className="flex-1 overflow-hidden">
+        {!sessionActive ? (
+          <SetupScreen state={state} update={updateState} onLaunch={() => setSessionActive(true)} />
+        ) : state.condition === "A" ? (
+          <ConditionAScreen state={state} onEndSession={resetSession} />
+        ) : (
+          <ConditionBScreen state={state} updateState={updateState} onEndSession={resetSession} />
+        )}
       </div>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppShell />
     </AppErrorBoundary>
   );
 }
