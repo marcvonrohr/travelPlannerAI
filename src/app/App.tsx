@@ -344,8 +344,13 @@ const SuggestionChipsComponent = defineComponent({
     return (
       <div className="mt-2 w-full rounded-2xl border border-dashed bg-white p-4" style={{ borderColor: T_BORDER }}>
         <div className="mb-3 flex items-center gap-2">
-          <Zap className="h-4 w-4" style={{ color: T }} />
-          <h4 className="text-[10px] font-bold uppercase tracking-widest text-gray-500">{props.title}</h4>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <Zap className="h-4 w-4 flex-shrink-0" style={{ color: T }} />
+            <h4 className="text-[10px] font-bold uppercase tracking-widest text-gray-500">{props.title}</h4>
+          </div>
+          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: T }}>
+            AI-generated
+          </span>
         </div>
         <div className="flex flex-wrap gap-2">
           {props.suggestions.map((suggestion) => (
@@ -379,7 +384,12 @@ const PreferenceOptionsComponent = defineComponent({
 
     return (
       <div className="mt-2 w-full rounded-2xl border border-dashed bg-white p-4" style={{ borderColor: T_BORDER }}>
-        <p className="mb-3 text-sm font-semibold text-slate-700">{props.question}</p>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <p className="text-sm font-semibold text-slate-700">{props.question}</p>
+          <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: T }}>
+            AI-generated
+          </span>
+        </div>
         <div className="flex flex-wrap gap-2">
           {props.options.map((option) => (
             <button
@@ -463,6 +473,9 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "For a pure greeting or vague opening with no concrete travel information, respond with text only. Do not output OpenUI and do not send an empty StateUpdate.",
     "Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.",
     "For inputs such as \"I need gluten-free food and want Japan\", capture both destination and dietary preference in StateUpdate, then ask one missing basic such as duration, travelers, or budget.",
+    "Use HotelOptions only after you have first elicited lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.",
+    "Do not draft a full sightseeing itinerary until sightseeing priorities and preferred pace are known or strongly implied.",
+    "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
@@ -485,6 +498,9 @@ Behavior rules:
 - For vague openings, ask one focused question; for concrete constraints such as gluten-free food and Japan, capture them immediately in StateUpdate.
 - For a pure greeting or vague opening with no concrete travel information, respond with text only; do not output OpenUI and do not send an empty StateUpdate.
 - Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.
+- Use HotelOptions only after first eliciting lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.
+- Do not draft a full sightseeing itinerary until sightseeing priorities and preferred pace are known or strongly implied.
+- When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
 - If the user clicks an interactive widget, treat the resulting user message as an explicit choice.
@@ -883,13 +899,9 @@ const parseTripPatchFromOpenUI = (openUI: string | undefined) => {
   }
 };
 
-const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[]) => {
+const mergePreferences = (_existing: UserPreference[], incoming?: UserPreference[]) => {
   if (!incoming) return existing;
-  const byLabel = new globalThis.Map(existing.map((pref) => [normalizeTextKey(pref.label), pref]));
-  incoming.forEach((pref) => {
-    byLabel.set(normalizeTextKey(pref.label), { ...byLabel.get(normalizeTextKey(pref.label)), ...pref });
-  });
-  return Array.from(byLabel.values());
+  return incoming;
 };
 
 const mergeDays = (existing: DayPlan[], incoming?: DayPlan[], focus?: FocusTarget | null) => {
@@ -1891,6 +1903,7 @@ function ConditionBScreen({
   const eventsRef = useRef<SessionEvent[]>([]);
   const startRef = useRef({ time: Date.now(), str: new Date().toISOString() });
   const endRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -1905,7 +1918,11 @@ function ConditionBScreen({
   }, []);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = chatScrollRef.current;
+    if (!container) return;
+    window.requestAnimationFrame(() => {
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    });
   }, [messages, state.focus]);
 
   const applyOpenUITripPatch = (patch: TripPatch, messageId: string) => {
@@ -2119,11 +2136,11 @@ function ConditionBScreen({
   const lastMessageId = messages[messages.length - 1]?.id;
 
   return (
-    <div className="grid h-full w-full bg-slate-50" style={{ gridTemplateColumns: "minmax(320px, 1fr) minmax(0, 2fr)" }}>
-      <div className="relative z-10 flex min-w-0 flex-col border-r border-gray-200 bg-white shadow-xl">
+    <div className="grid h-full min-h-0 w-full overflow-hidden bg-slate-50" style={{ gridTemplateColumns: "minmax(320px, 1fr) minmax(0, 2fr)" }}>
+      <div className="relative z-10 flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-gray-200 bg-white shadow-xl">
         <ChatHeader onEndSession={handleEndSession} />
         {state.focus && <FocusBanner focus={state.focus} onCancel={cancelFocus} />}
-        <div className="flex flex-1 flex-col overflow-y-auto px-5 pb-2 pt-5">
+        <div ref={chatScrollRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pb-2 pt-5">
           {messages.length === 0 && (
             <div className="mt-auto rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 text-center" style={{ background: "#FAFAFA" }}>
               <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full" style={{ background: T_LIGHT }}>
@@ -2147,9 +2164,9 @@ function ConditionBScreen({
         <ChatInputBar onSend={(message) => handleSend(message, "typed")} disabled={isLoading} />
       </div>
 
-      <div className="flex min-w-0 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
         <MetricsGrid trip={state.trip} />
-        <div className="relative flex-1 overflow-y-auto px-8">
+        <div className="relative min-h-0 flex-1 overflow-y-auto px-8">
           <ItineraryArtifact trip={state.trip} focus={state.focus} onSetFocus={setEditFocus} />
         </div>
         <PreferencesSection trip={state.trip} />
