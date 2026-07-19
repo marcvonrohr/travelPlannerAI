@@ -159,6 +159,13 @@ type TripPatch = Partial<Omit<TripState, "preferences" | "days">> & {
   days?: DayPlan[];
 };
 
+type PendingEdit = {
+  id: string;
+  messageId: string;
+  patch: TripPatch;
+  focus: FocusTarget;
+};
+
 type StateUpdate = Partial<S> | ((prev: S) => S);
 type StateUpdater = (update: StateUpdate) => void;
 
@@ -307,14 +314,29 @@ const QuickPreferencesComponent = defineComponent({
   component: ({ props }) => {
     const triggerAction = useTriggerAction();
     const isStreaming = useIsStreaming();
-    const dietary = props.dietary?.length ? props.dietary : [
-      { label: "Gluten-free" },
-      { label: "Vegan" },
-      { label: "Halal" },
-      { label: "Nut-free" },
-    ];
-    const tiers = props.accommodationTiers?.length ? props.accommodationTiers : ["Hostel", "3-Star", "Luxury"];
+    const dietary = props.dietary ?? [];
+    const tiers = props.accommodationTiers ?? [];
+    const hasDietary = dietary.length > 0;
+    const hasAccommodation = tiers.length > 0 || props.selectedTier || props.minPrice || props.maxPrice || props.selectedPrice;
     const currency = props.currency || "CHF";
+    const [selectedDietary, setSelectedDietary] = useState<string[]>(() => dietary.filter((item) => item.selected).map((item) => item.label));
+    const [selectedTier, setSelectedTier] = useState(props.selectedTier ?? "");
+    const [selectedPrice, setSelectedPrice] = useState<number | undefined>(props.selectedPrice);
+
+    if (!hasDietary && !hasAccommodation) return null;
+
+    const toggleDietary = (label: string) => {
+      setSelectedDietary((current) => (current.includes(label) ? current.filter((item) => item !== label) : [...current, label]));
+    };
+    const confirmSelections = () => {
+      const parts = [
+        selectedDietary.length ? `dietary preferences: ${selectedDietary.join(", ")}` : "",
+        selectedTier ? `accommodation tier: ${selectedTier}` : "",
+        selectedPrice ? `accommodation budget: about ${selectedPrice} ${currency} per night` : "",
+      ].filter(Boolean);
+      if (parts.length) triggerAction(`My selected preferences are ${parts.join("; ")}.`);
+    };
+    const canConfirm = selectedDietary.length > 0 || Boolean(selectedTier) || Boolean(selectedPrice);
 
     return (
       <div className="mt-2 w-full rounded-2xl border border-dashed bg-white shadow-sm" style={{ borderColor: T_BORDER }}>
@@ -325,53 +347,72 @@ const QuickPreferencesComponent = defineComponent({
             AI-generated
           </div>
         </div>
-        <div className="grid gap-4 p-4 sm:grid-cols-2">
-          <div>
-            <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Dietary</div>
-            <div className="grid grid-cols-2 gap-2">
-              {dietary.map((item) => (
+        <div className={`grid gap-4 p-4 ${hasDietary && hasAccommodation ? "sm:grid-cols-2" : ""}`}>
+          {hasDietary && (
+            <div>
+              <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Dietary</div>
+              <div className="grid grid-cols-2 gap-2">
+                {dietary.map((item) => {
+                  const selected = selectedDietary.includes(item.label);
+                  return (
+                    <button
+                      key={item.label}
+                      disabled={isStreaming}
+                      onClick={() => toggleDietary(item.label)}
+                      className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <span className="flex h-4 w-4 items-center justify-center rounded border" style={{ background: selected ? T : "white", borderColor: selected ? T : "#CBD5E1" }}>
+                        {selected && <Check className="h-3 w-3 text-white" />}
+                      </span>
+                      <span className="text-slate-700">{item.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {hasAccommodation && (
+            <div>
+              <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Accommodation</div>
+              {tiers.length > 0 && (
+                <div className="mb-3 flex flex-wrap gap-1.5">
+                  {tiers.map((tier) => {
+                    const selected = tier === selectedTier;
+                    return (
+                      <button
+                        key={tier}
+                        disabled={isStreaming}
+                        onClick={() => setSelectedTier((current) => (current === tier ? "" : tier))}
+                        className="rounded-lg border px-2.5 py-1 text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                        style={{ background: selected ? T : "white", borderColor: selected ? T : T_BORDER, color: selected ? "white" : "#475569" }}
+                      >
+                        {tier}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {(props.minPrice || props.maxPrice || props.selectedPrice) && (
                 <button
-                  key={item.label}
                   disabled={isStreaming}
-                  onClick={() => triggerAction(`${item.selected ? "Remove" : "Add"} dietary preference: ${item.label}.`)}
-                  className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={() => setSelectedPrice((current) => (current ? undefined : props.selectedPrice ?? props.maxPrice ?? props.minPrice))}
+                  className="w-full rounded-lg border bg-white px-3 py-2 text-left text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  style={{ background: selectedPrice ? T_LIGHT : "white", borderColor: T_BORDER, color: T }}
                 >
-                  <span className="flex h-4 w-4 items-center justify-center rounded border" style={{ background: item.selected ? T : "white", borderColor: item.selected ? T : "#CBD5E1" }}>
-                    {item.selected && <Check className="h-3 w-3 text-white" />}
-                  </span>
-                  <span className="text-slate-700">{item.label}</span>
+                  ~{props.minPrice ?? 0}-{props.maxPrice ?? props.selectedPrice ?? 0} {currency}/night
                 </button>
-              ))}
+              )}
             </div>
-          </div>
-          <div>
-            <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-gray-400">Accommodation</div>
-            <div className="mb-3 flex flex-wrap gap-1.5">
-              {tiers.map((tier) => {
-                const selected = tier === props.selectedTier;
-                return (
-                  <button
-                    key={tier}
-                    disabled={isStreaming}
-                    onClick={() => triggerAction(`I prefer ${tier} accommodation.`)}
-                    className="rounded-lg border px-2.5 py-1 text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                    style={{ background: selected ? T : "white", borderColor: selected ? T : T_BORDER, color: selected ? "white" : "#475569" }}
-                  >
-                    {tier}
-                  </button>
-                );
-              })}
-            </div>
-            {(props.minPrice || props.maxPrice || props.selectedPrice) && (
-              <button
-                disabled={isStreaming}
-                onClick={() => triggerAction(`My accommodation budget is about ${props.selectedPrice ?? props.maxPrice ?? props.minPrice} ${currency} per night.`)}
-                className="w-full rounded-lg border bg-white px-3 py-2 text-left text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                style={{ borderColor: T_BORDER, color: T }}
-              >
-                ~{props.minPrice ?? 0}-{props.maxPrice ?? props.selectedPrice ?? 0} {currency}/night
-              </button>
-            )}
+          )}
+          <div className={hasDietary && hasAccommodation ? "sm:col-span-2" : ""}>
+            <button
+              disabled={isStreaming || !canConfirm}
+              onClick={confirmSelections}
+              className="w-full rounded-xl px-3 py-2 text-xs font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ background: T }}
+            >
+              Confirm selected preferences
+            </button>
           </div>
         </div>
       </div>
@@ -581,8 +622,11 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.",
     "When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.",
     "Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.",
+    "Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.",
+    "Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.",
+    "Initial high-level drafts should include balanced placeholders or concrete entries for transport, meals, activities, rest/free time, and lodging where relevant.",
     "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
-    "Use QuickPreferences only after asking a relevant preference question about dietary needs or accommodation needs.",
+    "Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
@@ -615,7 +659,10 @@ Behavior rules:
 - For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.
 - When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.
 - Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.
-- Use QuickPreferences only after asking a relevant preference question about dietary needs or accommodation needs.
+- Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.
+- Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.
+- Initial high-level drafts should include balanced placeholders or concrete entries for transport, meals, activities, rest/free time, and lodging where relevant.
+- Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.
 - When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
@@ -849,8 +896,9 @@ const computeDayCost = (day: DayPlan, fallbackNightlyCost?: number) => {
   const hotelCost = getDayHotelCost(day, fallbackNightlyCost);
   const activitiesCost = day.activities.reduce((sum, activity) => sum + (activity.cost ?? 0), 0);
   const explicitSpend = typeof day.spend === "number" && !Number.isNaN(day.spend) ? day.spend : undefined;
-  if (explicitSpend === undefined) return activitiesCost + hotelCost;
-  return explicitSpend >= activitiesCost + hotelCost ? explicitSpend : explicitSpend + hotelCost;
+  const hasItemizedCosts = hotelCost > 0 || day.activities.some((activity) => typeof activity.cost === "number" && !Number.isNaN(activity.cost));
+  if (hasItemizedCosts) return activitiesCost + hotelCost;
+  return explicitSpend ?? 0;
 };
 
 function computeTripMetrics(trip: TripState) {
@@ -1120,6 +1168,11 @@ const applyTripPatch = (trip: TripState, patch: TripPatch, focus?: FocusTarget |
   days: mergeDays(trip.days, patch.days, focus),
 });
 
+const markPatchDaysDraft = (patch: TripPatch): TripPatch => ({
+  ...patch,
+  days: patch.days?.map((day) => ({ ...day, completed: false })),
+});
+
 // --- Gemini API ---------------------------------------------------------------
 class RetryableGeminiError extends Error {}
 
@@ -1346,6 +1399,48 @@ function FocusBanner({ focus, onCancel }: { focus: FocusTarget; onCancel: () => 
         <XCircle className="h-3.5 w-3.5" />
         Cancel
       </button>
+    </div>
+  );
+}
+
+function PendingEditReview({
+  pending,
+  onAccept,
+  onReject,
+}: {
+  pending: PendingEdit;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  const affectedDays = pending.patch.days?.map((day) => `Day ${day.day}`).join(", ") || pending.focus.label;
+
+  return (
+    <div className="z-10 border-b px-5 py-3" style={{ background: AMBER_LIGHT, borderColor: AMBER_BORDER }}>
+      <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-widest" style={{ color: AMBER }}>
+        <AlertTriangle className="h-3.5 w-3.5" />
+        Pending itinerary change
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs leading-relaxed text-slate-700">
+          Gemini proposed changes for {affectedDays}. Review them before updating the plan.
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={onReject}
+            className="rounded-lg border bg-white px-3 py-1.5 text-xs font-bold transition hover:bg-slate-50"
+            style={{ borderColor: AMBER_BORDER, color: AMBER }}
+          >
+            Reject changes
+          </button>
+          <button
+            onClick={onAccept}
+            className="rounded-lg px-3 py-1.5 text-xs font-bold text-white transition hover:opacity-90"
+            style={{ background: T }}
+          >
+            Accept changes
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1643,31 +1738,29 @@ function ItineraryArtifact({
 
             {isOpen && (
               <div className="border-t border-slate-100 bg-slate-50 px-4 py-3">
-                {(day.summary || day.hotel) && (
-                  <div className="mb-3 grid gap-2 sm:grid-cols-2">
-                    {day.summary && <p className="rounded-xl bg-white px-3 py-2 text-xs leading-relaxed text-gray-500">{day.summary}</p>}
-                    {day.hotel && (
-                      <div className="rounded-xl bg-white px-3 py-2 text-xs text-gray-500">
-                        <div className="mb-1 flex items-center gap-1.5 font-semibold text-slate-700">
-                          <Hotel className="h-3.5 w-3.5" />
-                          {day.hotel.name}
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span>{[day.hotel.tier, day.hotel.city, formatMoney(day.hotel.pricePerNight, trip.currency)].filter(Boolean).join(" - ")}</span>
-                          <button
-                            onClick={() => onSetFocus({ type: "hotel", day: day.day, label: `Editing Day ${day.day} hotel` })}
-                            className="rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-teal-200"
-                            style={{ borderColor: T_BORDER, color: T }}
-                          >
-                            Edit
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
+                {day.summary && <p className="mb-3 rounded-xl bg-white px-3 py-2 text-xs leading-relaxed text-gray-500">{day.summary}</p>}
 
                 <div className="mb-3 space-y-2">
+                  {day.hotel && (
+                    <div className="flex items-start gap-3 rounded-xl bg-white px-3 py-2">
+                      <span className="mt-0.5 flex w-20 flex-shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+                        <Hotel className="h-3.5 w-3.5" />
+                        Stay
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium text-slate-700">{day.hotel.name}</div>
+                        <div className="text-xs text-gray-400">{[day.hotel.tier, day.hotel.city].filter(Boolean).join(" - ")}</div>
+                      </div>
+                      {typeof day.hotel.pricePerNight === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(day.hotel.pricePerNight, trip.currency)}</span>}
+                      <button
+                        onClick={() => onSetFocus({ type: "hotel", day: day.day, label: `Editing Day ${day.day} hotel` })}
+                        className="flex-shrink-0 rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-teal-200"
+                        style={{ borderColor: T_BORDER, color: T }}
+                      >
+                        Edit
+                      </button>
+                    </div>
+                  )}
                   {day.activities.map((activity, index) => (
                     <div key={`${activity.time}-${activity.name}-${index}`} className="flex items-start gap-3 rounded-xl bg-white px-3 py-2" style={activity.changed ? { background: GREEN_LIGHT } : undefined}>
                       <span className="mt-0.5 w-20 flex-shrink-0 font-mono text-[10px] text-gray-400">{activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : activity.time || "--:--"}</span>
@@ -1824,6 +1917,8 @@ function AppShell() {
   const resetSession = () => {
     updateState((previous) => ({
       ...previous,
+      participantId: "",
+      researcher: "",
       trip: emptyTripState(),
       focus: null,
     }));
@@ -2127,6 +2222,7 @@ function ConditionBScreen({
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
   const messagesRef = useRef<Message[]>([]);
   const stateRef = useRef(state);
   const eventsRef = useRef<SessionEvent[]>([]);
@@ -2271,12 +2367,30 @@ function ConditionBScreen({
       });
 
       if (patchToApply) {
-        applyOpenUITripPatch(patchToApply, aiMsgId);
-        postClientLog({
-          type: "state_patch_applied",
-          messageId: aiMsgId,
-          patch: patchToApply,
-        });
+        const activeFocus = stateRef.current.focus;
+        if (activeFocus && patchToApply.days?.length) {
+          setPendingEdit({ id: makeId(), messageId: aiMsgId, patch: patchToApply, focus: activeFocus });
+          appendEvent(eventsRef, {
+            type: "state_update",
+            role: "system",
+            messageId: aiMsgId,
+            content: "Focused itinerary patch held for review",
+            metadata: { patch: patchToApply, focus: activeFocus },
+          });
+          postClientLog({
+            type: "state_patch_pending_review",
+            messageId: aiMsgId,
+            patch: patchToApply,
+            focus: activeFocus,
+          });
+        } else {
+          applyOpenUITripPatch(patchToApply, aiMsgId);
+          postClientLog({
+            type: "state_patch_applied",
+            messageId: aiMsgId,
+            patch: patchToApply,
+          });
+        }
       }
 
       appendEvent(eventsRef, {
@@ -2328,6 +2442,7 @@ function ConditionBScreen({
   };
 
   const setEditFocus = (focus: FocusTarget) => {
+    setPendingEdit(null);
     updateState({ focus });
     appendEvent(eventsRef, {
       type: "ui_action",
@@ -2336,6 +2451,32 @@ function ConditionBScreen({
       content: `Focus ${focus.label}`,
       metadata: focus,
     });
+  };
+
+  const acceptPendingEdit = () => {
+    if (!pendingEdit) return;
+    const patch = markPatchDaysDraft(pendingEdit.patch);
+    applyOpenUITripPatch(patch, pendingEdit.messageId);
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "pending_edit",
+      content: "Accept focused itinerary changes",
+      metadata: { pendingId: pendingEdit.id, focus: pendingEdit.focus, patch },
+    });
+    setPendingEdit(null);
+  };
+
+  const rejectPendingEdit = () => {
+    if (!pendingEdit) return;
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "pending_edit",
+      content: "Reject focused itinerary changes",
+      metadata: { pendingId: pendingEdit.id, focus: pendingEdit.focus, patch: pendingEdit.patch },
+    });
+    setPendingEdit(null);
   };
 
   const toggleDayComplete = (dayNumber: number) => {
@@ -2366,6 +2507,7 @@ function ConditionBScreen({
 
   const cancelFocus = () => {
     const previousFocus = stateRef.current.focus;
+    setPendingEdit(null);
     updateState({ focus: null });
     appendEvent(eventsRef, {
       type: "ui_action",
@@ -2406,6 +2548,7 @@ function ConditionBScreen({
       <div className="relative z-10 flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-gray-200 bg-white shadow-xl">
         <ChatHeader onEndSession={handleEndSession} />
         {state.focus && <FocusBanner focus={state.focus} onCancel={cancelFocus} />}
+        {pendingEdit && <PendingEditReview pending={pendingEdit} onAccept={acceptPendingEdit} onReject={rejectPendingEdit} />}
         <div ref={chatScrollRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pb-2 pt-5">
           {messages.length === 0 && (
             <div className="mt-auto rounded-2xl border-2 border-dashed border-gray-200 px-8 py-10 text-center" style={{ background: "#FAFAFA" }}>
