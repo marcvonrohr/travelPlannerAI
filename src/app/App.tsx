@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ClipboardCheck,
   Download,
   FlaskConical,
   Hotel,
@@ -15,6 +16,7 @@ import {
   Pencil,
   Play,
   Sparkles,
+  Terminal,
   TrendingUp,
   XCircle,
   Zap,
@@ -109,6 +111,7 @@ type TripState = {
 };
 
 type FocusTarget =
+  | { type: "trip"; label: string }
   | { type: "day"; day: number; label: string }
   | { type: "hotel"; day: number; label: string }
   | { type: "activity"; day: number; activityIndex: number; activityName: string; label: string };
@@ -164,9 +167,46 @@ type PendingEdit = {
   messageId: string;
   patch: TripPatch;
   focus: FocusTarget;
+  userText?: string;
 };
 
 type PendingDayAction = (day: number) => void;
+
+type CoverageIssue = {
+  id: string;
+  severity: "missing" | "warning";
+  label: string;
+  detail: string;
+  day?: number;
+};
+
+type CoverageSummary = {
+  total: number;
+  missing: number;
+  warnings: number;
+  preferenceConflicts: number;
+  missingCosts: number;
+  missingEndTimes: number;
+  missingActionableDetails: number;
+  missingMeals: number;
+  missingTransport: number;
+  missingLodging: number;
+  arrivalReturnGaps: number;
+  affectedDays: number[];
+};
+
+type CompletionWarning = {
+  day: number;
+  issues: CoverageIssue[];
+};
+
+type ResearchConsoleEntry = {
+  id: string;
+  timestamp: string;
+  type: string;
+  summary: string;
+  payload?: unknown;
+};
 
 type StateUpdate = Partial<S> | ((prev: S) => S);
 type StateUpdater = (update: StateUpdate) => void;
@@ -243,7 +283,7 @@ const StateUpdateComponent = defineComponent({
 const HotelOptionsComponent = defineComponent({
   name: "HotelOptions",
   description:
-    "Interactive hotel tier or hotel-card selector. Every option click continues the conversation.",
+    "Interactive selector for concrete named hotel or lodging cards. Every option click continues the conversation.",
   props: z.object({
     title: z.string(),
     options: z.array(
@@ -274,14 +314,18 @@ const HotelOptionsComponent = defineComponent({
         </div>
         <div className="grid gap-2 sm:grid-cols-3">
           {props.options.map((option) => {
+            const isConcreteStay = Boolean(option.name?.trim());
             const label = option.name ? `${option.tier}: ${option.name}` : option.tier;
             const price = formatMoney(option.pricePerNight);
             const location = option.city ? ` in ${option.city}` : "";
+            const actionText = isConcreteStay
+              ? `I choose ${label}${location}${price ? ` at about ${price} per night` : ""}.`
+              : `The ${option.tier} accommodation style fits me${price ? ` at about ${price} per night` : ""}. Please suggest concrete named hotels or lodgings for the applicable days before adding anything to the itinerary.`;
             return (
               <button
                 key={`${option.tier}-${option.name ?? "option"}`}
                 disabled={isStreaming}
-                onClick={() => triggerAction(`I choose ${label}${location}${price ? ` at about ${price} per night` : ""}.`)}
+                onClick={() => triggerAction(actionText)}
                 className="min-h-[112px] rounded-xl border bg-white px-3 py-3 text-left transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                 style={{ borderColor: T_BORDER }}
               >
@@ -290,6 +334,11 @@ const HotelOptionsComponent = defineComponent({
                   {price && <span className="text-xs font-bold" style={{ color: T }}>{price}</span>}
                 </div>
                 {option.name && <div className="text-xs font-medium text-gray-500">{[option.name, option.city].filter(Boolean).join(" - ")}</div>}
+                {!option.name && (
+                  <div className="text-[11px] font-semibold" style={{ color: AMBER }}>
+                    Style preference only - concrete stay needed
+                  </div>
+                )}
                 {option.summary && <p className="mt-2 text-xs leading-relaxed text-gray-500">{option.summary}</p>}
                 {option.fit && <p className="mt-2 text-[11px] font-semibold" style={{ color: T }}>{option.fit}</p>}
               </button>
@@ -617,6 +666,7 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.",
     "For inputs such as \"I need gluten-free food and want Japan\", capture both destination and dietary preference in StateUpdate, then ask one missing basic such as duration, travelers, or budget.",
     "Use HotelOptions only after you have first elicited lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.",
+    "If you are still eliciting accommodation style or price tier, use PreferenceOptions or QuickPreferences instead of HotelOptions.",
     "HotelOptions must present concrete named hotel or lodging choices, not abstract categories. Each option needs tier, name, pricePerNight, summary, and fit.",
     "Do not write an abstract lodging category such as \"Budget Guesthouse\" into day.hotel. After a user selects a lodging style, offer concrete hotel/lodging names before booking the itinerary.",
     "For multi-stop trips, assign concrete lodging per base or city and write the correct lodging only to the applicable days.",
@@ -632,10 +682,14 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.",
     "Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.",
     "Before planning meals, ask the user Socratic questions about meal rhythm, dietary restrictions, cuisine priorities, and how detailed the food plan should be.",
+    "Do not ask the same dietary or meal-preference widget twice. If a dietary requirement is already captured, ask the next missing food-planning question such as meal rhythm, cuisine style, budget per meal, or restaurant detail level.",
+    "When the user states a meal rhythm such as 3 meals per day, capture it as an active preference with label \"Meal rhythm\", value such as \"3 meals per day\", category \"diet\", status \"captured\".",
     "Before planning transport, ask about comfort, time, cost, and independence trade-offs when the choice is ambiguous.",
     "Initial high-level drafts should include balanced placeholders or concrete entries for transport, meals, activities, rest/free time, and lodging where relevant.",
     "Final itinerary entries must be actionable: transport needs from/to, mode, duration, and schedule guidance; meals need meal type, place/area, and dietary fit; activities need what to do, why it fits, duration, and cost.",
     "Avoid bare labels such as \"Transfer\", \"Dinner\", \"Old Town\", or \"Hiking\" in StateUpdate.days. Add implementation detail in note and use endTime.",
+    "Every activity must include a numeric cost. Use 0 for free sights, realistic average prices for meals, and estimated fares for transport.",
+    "Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.",
     "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
     "Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
@@ -653,6 +707,16 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
 });
 
 // --- Prompts and context ------------------------------------------------------
+const SOCRATIC_COMPLETION_CONTRACT = `Socratic completion contract:
+- Work in phases: 1) basics, 2) route shape, 3) lodging, 4) meal rhythm and dietary fit, 5) transport, 6) daily activities, 7) review and conflict resolution.
+- Never treat the plan as complete while the local coverage issues indicate missing meals, missing transport, missing lodging, missing numeric costs, missing end times, missing arrival/return decisions, or sparse activity details.
+- At the start of every turn, review the current hidden itinerary state for flaws, contradictions, missing implementation detail, missing costs, missing meals, missing transport, and arrival/return gaps. Use that review together with the user's latest request to decide the best next step.
+- If the user changes the route shape materially, such as adding another region or replacing the destination focus, restart the affected future segment Socratically instead of patching one token. Ask which existing days should be repurposed, then propose revised affected days via StateUpdate.days.
+- When hidden routeChangeIntent is present, do not answer only in prose. If affected days are unclear, ask one question about the segment to repurpose; if they are clear, propose revised StateUpdate.days only for those days and preserve earlier accepted days.
+- If the user expresses a preference that conflicts with an active preference, keep the existing preference unless the user explicitly resolves the conflict. Use ConflictWarning or a conflict preference status instead of silently merging incompatible preferences.
+- The final itinerary must be executable by a person without further interpretation: each item needs a clear purpose, location or route, timing, duration, estimated cost, and reason it fits the constraints.
+- Preserve user agency: ask one targeted question when a meaningful planning choice is missing; only generate concrete itinerary details after the relevant user preference is known or strongly implied.`;
+
 const SYSTEM_PROMPT_B = `You are the experimental Socratic Planner for a travel-planning study.
 
 Behavior rules:
@@ -664,6 +728,7 @@ Behavior rules:
 - For a pure greeting or vague opening with no concrete travel information, respond with text only; do not output OpenUI and do not send an empty StateUpdate.
 - Do not offer specific destination examples unless the user asks for inspiration or has provided constraints that make those options meaningfully grounded.
 - Use HotelOptions only after first eliciting lodging needs such as price range, comfort level, location, accessibility, dietary/logistical needs, or hotel style.
+- If you are still eliciting accommodation style or price tier, use PreferenceOptions or QuickPreferences instead of HotelOptions.
 - HotelOptions must present concrete named hotel or lodging choices, not abstract categories. Each option needs tier, name, pricePerNight, summary, and fit.
 - Do not write an abstract lodging category such as "Budget Guesthouse" into day.hotel. After a user selects a lodging style, offer concrete hotel/lodging names before booking the itinerary.
 - For multi-stop trips, assign concrete lodging per base or city and write the correct lodging only to the applicable days.
@@ -679,22 +744,57 @@ Behavior rules:
 - Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.
 - Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.
 - Before planning meals, ask Socratic questions about meal rhythm, dietary restrictions, cuisine priorities, and how detailed the food plan should be.
+- Do not ask the same dietary or meal-preference widget twice. If a dietary requirement is already captured, ask the next missing food-planning question such as meal rhythm, cuisine style, budget per meal, or restaurant detail level.
+- When the user states a meal rhythm such as 3 meals per day, capture it as an active preference with label "Meal rhythm", value such as "3 meals per day", category "diet", status "captured".
 - Before planning transport, ask about comfort, time, cost, and independence trade-offs when the choice is ambiguous.
 - Initial high-level drafts should include balanced placeholders or concrete entries for transport, meals, activities, rest/free time, and lodging where relevant.
 - Final itinerary entries must be actionable: transport needs from/to, mode, duration, and schedule guidance; meals need meal type, place/area, and dietary fit; activities need what to do, why it fits, duration, and cost.
 - Avoid bare labels such as "Transfer", "Dinner", "Old Town", or "Hiking" in StateUpdate.days. Add implementation detail in note and use endTime.
+- Every activity must include a numeric cost. Use 0 for free sights, realistic average prices for meals, and estimated fares for transport.
+- Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.
 - Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.
 - When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
+- For every Condition B user request, silently compare the latest request against the current hidden itinerary and coverage issues. Mention only the relevant implication in prose, then either ask one Socratic next question or propose a reviewable StateUpdate patch. Do not ignore plan flaws that affect the user's request.
 - If the user clicks an interactive widget, treat the resulting user message as an explicit choice.
 - If a focus day is active, answer only for that day and preserve the rest of the itinerary.
 - If a focus hotel or focus activity is active, update only that field unless the user explicitly asks for the whole trip, every day, or all hotels.
+- If hidden routeChangeIntent is present, treat the request as a future-segment redesign. Ask which days to repurpose when unclear; otherwise return a StateUpdate.days patch for only the affected days. Keep earlier completed or accepted days unchanged unless the user explicitly includes them.
+
+${SOCRATIC_COMPLETION_CONTRACT}
 
 ${OPENUI_PROMPT}`;
 
+const formatCurrentItineraryDigest = (trip: TripState) => {
+  if (!trip.days.length) return "No itinerary days have been generated yet.";
+
+  return trip.days
+    .map((day) => {
+      const location = day.location || day.city || trip.destination || "location missing";
+      const hotel = day.hotel?.name
+        ? `Stay: ${day.hotel.name}${day.hotel.city ? ` (${day.hotel.city})` : ""}${typeof day.hotel.pricePerNight === "number" ? `, ${day.hotel.pricePerNight} ${trip.currency}/night` : ", cost missing"}`
+        : "Stay: missing";
+      const activities = day.activities.length
+        ? day.activities
+            .map((activity) => {
+              const time = activity.endTime ? `${activity.time || "time?"}-${activity.endTime}` : `${activity.time || "time?"}-end?`;
+              const cost = typeof activity.cost === "number" ? `${activity.cost} ${trip.currency}` : "cost missing";
+              const note = activity.note || "detail missing";
+              return `  - ${time}: ${activity.name} (${cost}) - ${note}`;
+            })
+            .join("\n")
+        : "  - activities missing";
+      return `Day ${day.day}: ${day.title} | ${location} | ${day.completed ? "completed" : "draft"} | ${hotel}\n${activities}`;
+    })
+    .join("\n\n");
+};
+
 const getTravelContextString = (condition: Condition, state: S) => {
   if (condition === "A") return "";
+
+  const coverageIssues = computeCoverageIssues(state.trip);
+  const coverageSummary = summarizeCoverageIssues(coverageIssues);
 
   return `CURRENT HIDDEN EXPERIMENT CONTEXT:
 ${JSON.stringify(
@@ -706,6 +806,8 @@ ${JSON.stringify(
         ? `The next user request applies only to ${state.focus.label}. Preserve all other itinerary data unless the user explicitly broadens the scope.`
         : "No focus target is active.",
     trip: state.trip,
+    currentHighLevelPlanDigest: formatCurrentItineraryDigest(state.trip),
+    coverageSummary,
     computedMetrics: computeTripMetrics(state.trip),
   },
   null,
@@ -732,10 +834,222 @@ const hasSparseDetails = (activity: Activity) => {
   return !activity.endTime || !activity.note || activity.note.length < 28 || bareLabel;
 };
 
+const hasSparseActionableDetail = (activity: Activity) => {
+  const bareLabel = /^(transfer|dinner|lunch|breakfast|old town|hiking|boat trip|zip-line)$/i.test(activity.name.trim());
+  return !activity.note || activity.note.length < 28 || bareLabel;
+};
+
+const isTransportLikeActivity = (activity: Activity) =>
+  isTransportActivity(activity) || /\b(lisboa card|subway|uber|bolt|cp\.pt|rede expressos|flixbus)\b/i.test(activityText(activity));
+
+const getMealTargetFromPreferences = (preferences: UserPreference[]) => {
+  const text = preferences.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" ").toLowerCase();
+  if (/\b(3x|3 x|three meals|3 meals|breakfast.*lunch.*dinner|drei mahlzeiten|3 mahlzeiten)\b/.test(text)) return 3;
+  if (/\b(2x|2 x|two meals|2 meals|zwei mahlzeiten|2 mahlzeiten)\b/.test(text)) return 2;
+  if (/\b(1x|1 x|one meal|1 meal|eine mahlzeit|1 mahlzeit)\b/.test(text)) return 1;
+  return null;
+};
+
+const normalizePlanningText = (text: string) =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const hasInboundOrOutboundTravel = (day: DayPlan, kind: "arrival" | "return") => {
+  const dayText = `${day.title} ${day.summary ?? ""} ${day.activities.map(activityText).join(" ")}`.toLowerCase();
+  return kind === "arrival"
+    ? /\b(arrival|arrive|airport|flight|train station|bus station|from home|from zurich|from zürich|from geneva|from basel|anreise|ankunft)\b/.test(dayText)
+    : /\b(return|departure|depart|airport|flight home|train home|back to|rückreise|rueckreise|abreise)\b/.test(dayText);
+};
+
+const getTravelBoundaryDecision = (preferences: UserPreference[], kind: "arrival" | "return") => {
+  const prefText = normalizePlanningText(preferences.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" "));
+  const boundaryPattern =
+    kind === "arrival"
+      ? /\b(arrival|arrive|inbound|origin|from home|flight out|train to|anreise|ankunft|hinreise)\b/
+      : /\b(return|departure|depart|flight home|train home|back home|ruckreise|rueckreise|abreise|heimreise)\b/;
+  const includePattern = /\b(include|included|plan|planned|with details|yes|ja|mit details|einplanen|planen)\b/;
+  const excludePattern = /\b(exclude|excluded|skip|without|no|not include|do not include|do not plan|nein|ohne|nicht planen|nicht einplanen|auslassen)\b/;
+
+  if (!boundaryPattern.test(prefText)) return "unknown";
+  if (excludePattern.test(prefText)) return "excluded";
+  if (includePattern.test(prefText)) return "included";
+  return "known";
+};
+
+const hasConcreteTransportDetail = (activity: Activity) => {
+  if (!isTransportLikeActivity(activity)) return true;
+  const text = activityText(activity);
+  return /\b(from|to|via|line|bus|train|metro|tram|ferry|station|terminal|duration|schedule|platform|route|lisboa card|cp\.pt|rede expressos|flixbus|ab|nach|linie|bahnhof|fahrplan)\b/i.test(text);
+};
+
+const computeCoverageIssues = (trip: TripState): CoverageIssue[] => {
+  const issues: CoverageIssue[] = [];
+  trip.preferences
+    .filter((pref) => pref.status === "conflict")
+    .forEach((pref, index) => {
+      issues.push({
+        id: `preference-conflict-${index}`,
+        severity: "missing",
+        label: `Preference conflict: ${pref.label}`,
+        detail: pref.value || "Ask the participant to resolve this preference conflict before finalizing the plan.",
+      });
+    });
+
+  if (!trip.days.length) return issues;
+
+  const mealTarget = getMealTargetFromPreferences(trip.preferences);
+  const prefText = trip.preferences.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" ").toLowerCase();
+  const travelToFromKnown = /\b(origin|from home|arrival|return|flight|train to|anreise|rückreise|rueckreise)\b/.test(prefText);
+
+  const arrivalDecision = getTravelBoundaryDecision(trip.preferences, "arrival");
+  const returnDecision = getTravelBoundaryDecision(trip.preferences, "return");
+
+  if (!mealTarget) {
+    issues.push({
+      id: "meal-rhythm",
+      severity: "missing",
+      label: "Meal rhythm not confirmed",
+      detail: "Ask whether the participant wants breakfast/lunch/dinner planned or only selected food stops.",
+    });
+  }
+
+  if (arrivalDecision === "unknown" && !hasInboundOrOutboundTravel(trip.days[0], "arrival")) {
+    issues.push({
+      id: "arrival-choice",
+      severity: "missing",
+      label: "Arrival planning missing",
+      detail: "Clarify whether the plan should include travel to the destination, origin, mode, time, and estimated cost.",
+    });
+  }
+
+  const lastDay = trip.days[trip.days.length - 1];
+  if (returnDecision === "unknown" && lastDay && !hasInboundOrOutboundTravel(lastDay, "return")) {
+    issues.push({
+      id: "return-choice",
+      severity: "missing",
+      label: "Return planning missing",
+      detail: "Clarify whether the return journey should be included with mode, route, time, and estimated cost.",
+    });
+  }
+
+  trip.days.forEach((day) => {
+    if (!day.hotel?.name) {
+      issues.push({ id: `day-${day.day}-hotel`, severity: "missing", day: day.day, label: `Day ${day.day}: lodging missing`, detail: "Add a concrete hotel/lodging name and nightly price." });
+    }
+    if (day.hotel && typeof day.hotel.pricePerNight !== "number") {
+      issues.push({ id: `day-${day.day}-hotel-cost`, severity: "missing", day: day.day, label: `Day ${day.day}: lodging cost missing`, detail: "Hotel/lodging needs a numeric pricePerNight." });
+    }
+
+    const meals = day.activities.filter(isMealActivity);
+    if (mealTarget !== null && meals.length < mealTarget) {
+      issues.push({
+        id: `day-${day.day}-meals`,
+        severity: "missing",
+        day: day.day,
+        label: `Day ${day.day}: meals incomplete`,
+        detail: `${meals.length}/${mealTarget} planned meals. Add nearby options with average prices and dietary fit.`,
+      });
+    }
+
+    if (!day.activities.some(isTransportLikeActivity)) {
+      issues.push({ id: `day-${day.day}-transport`, severity: "missing", day: day.day, label: `Day ${day.day}: transport missing`, detail: "Add local or intercity transport with route, mode, duration, and cost." });
+    }
+
+    day.activities.forEach((activity, index) => {
+      if (typeof activity.cost !== "number") {
+        issues.push({ id: `day-${day.day}-activity-${index}-cost`, severity: "missing", day: day.day, label: `Day ${day.day}: cost missing`, detail: `${activity.name} needs a numeric cost. Use 0 for free sights.` });
+      }
+      if (!activity.endTime) {
+        issues.push({ id: `day-${day.day}-activity-${index}-end`, severity: "missing", day: day.day, label: `Day ${day.day}: end time missing`, detail: `${activity.name} needs an approximate endTime.` });
+      }
+      if (hasSparseActionableDetail(activity)) {
+        issues.push({ id: `day-${day.day}-activity-${index}-detail`, severity: "missing", day: day.day, label: `Day ${day.day}: details too sparse`, detail: `${activity.name} should include actionable route, venue, booking, rationale, or schedule details.` });
+      }
+      if (isTransportLikeActivity(activity) && !hasConcreteTransportDetail(activity)) {
+        issues.push({ id: `day-${day.day}-activity-${index}-transport-detail`, severity: "missing", day: day.day, label: `Day ${day.day}: transport route unclear`, detail: `${activity.name} needs from/to, mode or line, duration, and where to check schedules.` });
+      }
+    });
+  });
+
+  return issues;
+};
+
+const summarizeCoverageIssues = (issues: CoverageIssue[]): CoverageSummary => {
+  const affectedDays = Array.from(
+    new Set(issues.map((issue) => issue.day).filter((day): day is number => typeof day === "number")),
+  ).sort((a, b) => a - b);
+
+  return {
+    total: issues.length,
+    missing: issues.filter((issue) => issue.severity === "missing").length,
+    warnings: issues.filter((issue) => issue.severity === "warning").length,
+    preferenceConflicts: issues.filter((issue) => issue.id.startsWith("preference-conflict")).length,
+    missingCosts: issues.filter((issue) => issue.id.includes("-cost")).length,
+    missingEndTimes: issues.filter((issue) => issue.id.endsWith("-end")).length,
+    missingActionableDetails: issues.filter((issue) => issue.id.endsWith("-detail")).length,
+    missingMeals: issues.filter((issue) => issue.id === "meal-rhythm" || issue.id.endsWith("-meals")).length,
+    missingTransport: issues.filter((issue) => issue.id.includes("-transport")).length,
+    missingLodging: issues.filter((issue) => issue.id.includes("-hotel")).length,
+    arrivalReturnGaps: issues.filter((issue) => issue.id === "arrival-choice" || issue.id === "return-choice").length,
+    affectedDays,
+  };
+};
+
+const getLatestUserText = (chatHistory: Message[]) =>
+  [...chatHistory].reverse().find((message) => message.sender === "user")?.rawText ?? "";
+
+const normalizeIntentText = (text: string) =>
+  text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+const extractRequestedStartDay = (text: string) => {
+  const normalizedText = normalizeIntentText(text);
+  const match = normalizedText.match(/\b(?:from|after|starting|ab|nach|seit)\s+(?:day|tag)\s*(\d{1,2})\b|\b(?:day|tag)\s*(\d{1,2})\s*(?:onward|onwards|forward|weiter|danach)\b/i);
+  const value = Number(match?.[1] ?? match?.[2]);
+  return Number.isFinite(value) && value > 0 ? value : null;
+};
+
+const getRouteChangeIntent = (trip: TripState, latestUserText: string) => {
+  if (!trip.days.length || !latestUserText.trim()) return null;
+
+  const text = normalizeIntentText(latestUserText);
+  const asksForRouteChange =
+    /\b(not only|also|instead|change|switch|replace|extend|add|include|rather|from day|after day|doch nicht nur|nicht nur|auch|stattdessen|wechseln|ersetzen|aendern|andern|ändern|umstellen|anpassen|erweitern|hinzufuegen|hinzufügen|ab tag|nach tag)\b/i.test(text);
+  const mentionsNewRouteShape =
+    /\b(algarve|coast|beach|surf|surfing|sea|island|mountain|second base|another city|another region|multi-stop|road trip|kueste|küste|strand|meer|insel|berge|surfen|zweite station|weitere stadt|weitere region|mehrere orte)\b/i.test(text);
+
+  const normalizedRouteChange = asksForRouteChange || /\b(hinzufugen|korrigieren|neu planen|umplanen)\b/i.test(text);
+  const normalizedRouteShape = mentionsNewRouteShape || /\b(kuste|surfkurs|surf lektion|surfschule|zweiter ort|zweite region)\b/i.test(text);
+
+  if (!normalizedRouteChange || !normalizedRouteShape) return null;
+
+  const requestedStartDay = extractRequestedStartDay(latestUserText);
+  const inferredStartDay = requestedStartDay;
+  const affectedDays =
+    inferredStartDay !== null
+      ? trip.days.filter((day) => day.day >= inferredStartDay).map((day) => day.day)
+      : [];
+
+  return {
+    detected: true,
+    latestUserText,
+    requestedStartDay,
+    inferredStartDay,
+    affectedDays,
+    instruction:
+      "Treat this as a route-shape change. If the affected days are unclear, ask one Socratic clarification about which days to repurpose. If clear, propose a StateUpdate.days patch only for the affected future segment and preserve earlier accepted days.",
+  };
+};
+
 const getPlanningStageGuidance = (state: S, chatHistory: Message[]) => {
   if (state.condition === "A") return "";
 
   const days = state.trip.days;
+  const latestUserText = getLatestUserText(chatHistory);
   const missingBasics = [
     state.trip.destination ? "" : "destination or region",
     typeof state.trip.budget === "number" ? "" : "budget",
@@ -744,10 +1058,18 @@ const getPlanningStageGuidance = (state: S, chatHistory: Message[]) => {
   ].filter(Boolean);
   const daysMissingHotels = days.filter((day) => !day.hotel?.name).map((day) => day.day);
   const daysMissingMeals = days.filter((day) => !day.activities.some(isMealActivity)).map((day) => day.day);
-  const daysMissingTransport = days.filter((day) => !day.activities.some(isTransportActivity)).map((day) => day.day);
+  const daysMissingTransport = days.filter((day) => !day.activities.some(isTransportLikeActivity)).map((day) => day.day);
   const sparseActivityDays = days
-    .filter((day) => day.activities.some(hasSparseDetails))
+    .filter((day) => day.activities.some(hasSparseActionableDetail))
     .map((day) => day.day);
+  const allCoverageIssues = computeCoverageIssues(state.trip);
+  const coverageIssues = allCoverageIssues.slice(0, 24);
+  const coverageSummary = summarizeCoverageIssues(allCoverageIssues);
+  const routeChangeIntent = getRouteChangeIntent(state.trip, latestUserText);
+  const travelBoundaryDecisions = {
+    arrival: getTravelBoundaryDecision(state.trip.preferences, "arrival"),
+    return: getTravelBoundaryDecision(state.trip.preferences, "return"),
+  };
   const assistantTurns = chatHistory.filter((message) => message.sender === "ai").length;
 
   return `CURRENT PLANNING STAGE GUIDANCE:
@@ -755,13 +1077,18 @@ ${JSON.stringify(
   {
     assistantTurns,
     activeFocus: state.focus,
+    latestUserText,
+    routeChangeIntent,
+    travelBoundaryDecisions,
     missingBasics,
     daysMissingHotels,
     daysMissingMeals,
     daysMissingTransport,
     sparseActivityDays,
+    coverageSummary,
+    coverageIssues,
     instruction:
-      "Use these gaps to choose the next Socratic step. Ask one useful question when preferences are missing. When the user has already answered, update StateUpdate.days with concrete, actionable details.",
+      "Before answering, evaluate the current itinerary against the latest user request, coverageSummary, and coverageIssues. Prioritize preference conflicts, missing costs, missing meals, missing transport, missing end times, and sparse details for the affected days. Do not repeat already captured preference widgets. Ask one useful question when preferences are missing. When routeChangeIntent is present, rework only the affected future segment or ask which days to repurpose. When the user has already answered, update StateUpdate.days with concrete, actionable details and numeric costs.",
   },
   null,
   2,
@@ -786,14 +1113,43 @@ const formatMoney = (value?: number | null, currency = "CHF") => {
   return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value)} ${currency}`;
 };
 
+const formatMessageTime = (timestamp: string) => {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+};
+
 const normalizeTextKey = (value: string) => value.trim().toLowerCase();
 
+const RESEARCH_CONSOLE_KEY = "voyagerlab:research-console";
+
+const appendResearchConsoleEntry = (type: string, summary: string, payload?: unknown) => {
+  if (typeof window === "undefined") return;
+  const entry: ResearchConsoleEntry = {
+    id: makeId(),
+    timestamp: getTimestamp(),
+    type,
+    summary,
+    payload,
+  };
+  try {
+    const existing = JSON.parse(window.localStorage.getItem(RESEARCH_CONSOLE_KEY) || "[]") as ResearchConsoleEntry[];
+    const next = [...existing, entry].slice(-400);
+    window.localStorage.setItem(RESEARCH_CONSOLE_KEY, JSON.stringify(next));
+    window.dispatchEvent(new CustomEvent("voyagerlab-console-log", { detail: entry }));
+  } catch {
+    // Local debug logging must never affect the experiment UI.
+  }
+};
+
 const appendEvent = (eventsRef: React.MutableRefObject<SessionEvent[]>, event: Omit<SessionEvent, "id" | "timestamp"> & { timestamp?: string }) => {
-  eventsRef.current.push({
+  const savedEvent = {
     id: makeId(),
     timestamp: event.timestamp ?? getTimestamp(),
     ...event,
-  });
+  };
+  eventsRef.current.push(savedEvent);
+  appendResearchConsoleEntry(savedEvent.type, savedEvent.content || savedEvent.source || savedEvent.role || "session event", savedEvent);
 };
 
 const escapeCSV = (value: unknown) => {
@@ -1002,7 +1358,8 @@ const metricCardsFromTrip = (trip: TripState) => {
   const metrics = computeTripMetrics(trip);
   const currency = trip.currency || "CHF";
   const hasCost = metrics.totalCost > 0;
-  const costSub =
+  const missingCostCount = computeCoverageIssues(trip).filter((issue) => /cost missing|cost$|cost missing/i.test(`${issue.label} ${issue.detail}`)).length;
+  const budgetSub =
     metrics.budgetDelta === null
       ? hasCost
         ? "budget not set"
@@ -1010,15 +1367,16 @@ const metricCardsFromTrip = (trip: TripState) => {
       : metrics.budgetDelta >= 0
         ? `${formatMoney(metrics.budgetDelta, currency)} under budget`
         : `${formatMoney(Math.abs(metrics.budgetDelta), currency)} over budget`;
+  const costSub = missingCostCount ? `${missingCostCount} costs missing - ${budgetSub}` : budgetSub;
 
   return [
     {
       label: "Est. Cost",
       value: hasCost ? formatMoney(metrics.totalCost, currency) : `0 ${currency}`,
       sub: costSub,
-      icon: metrics.budgetDelta !== null && metrics.budgetDelta < 0 ? <AlertTriangle className="h-3.5 w-3.5" style={{ color: RED }} /> : <span className="text-[10px] text-gray-300">{currency}</span>,
+      icon: metrics.budgetDelta !== null && metrics.budgetDelta < 0 ? <AlertTriangle className="h-3.5 w-3.5" style={{ color: RED }} /> : missingCostCount ? <AlertTriangle className="h-3.5 w-3.5" style={{ color: AMBER }} /> : <span className="text-[10px] text-gray-300">{currency}</span>,
       red: metrics.budgetDelta !== null && metrics.budgetDelta < 0,
-      green: metrics.budgetDelta !== null && metrics.budgetDelta >= 0 && hasCost,
+      green: metrics.budgetDelta !== null && metrics.budgetDelta >= 0 && hasCost && missingCostCount === 0,
     },
     {
       label: "Satisfied Prefs",
@@ -1040,6 +1398,31 @@ const metricCardsFromTrip = (trip: TripState) => {
     },
   ];
 };
+
+const formatCoverageReviewMessage = (issues: CoverageIssue[]) => {
+  if (!issues.length) {
+    return "Please review the current itinerary for completeness and tell me if anything important is still missing before I mark more days complete.";
+  }
+
+  const issueLines = issues
+    .slice(0, 12)
+    .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
+    .join("\n");
+
+  return `Please review the current itinerary against these local completeness gaps and help me resolve them step by step. Ask one Socratic question if a preference is missing; otherwise propose concrete StateUpdate.days fixes with itemized costs, transport details, meal details, and start/end times.\n\n${issueLines}`;
+};
+
+const formatDayCompletionReviewMessage = (dayNumber: number, issues: CoverageIssue[]) => {
+  const issueLines = issues
+    .slice(0, 8)
+    .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
+    .join("\n");
+
+  return `Please help me complete Day ${dayNumber}. The app blocked completion because these day-specific gaps remain. Ask one Socratic question if you still need a preference; otherwise propose a StateUpdate.days patch only for Day ${dayNumber} with actionable details, itemized costs, transport details, meal details, and start/end times.\n\n${issueLines}`;
+};
+
+const getBlockingDayCompletionIssues = (trip: TripState, dayNumber: number) =>
+  computeCoverageIssues(trip).filter((issue) => issue.day === dayNumber && issue.severity === "missing");
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1219,9 +1602,193 @@ const parseTripPatchFromOpenUI = (openUI: string | undefined) => {
   }
 };
 
-const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[]) => {
+const getOpenUISuppressionReason = (openUI: string, trip: TripState) => {
+  const normalizedOpenUI = openUI.toLowerCase();
+  const capturedPreferenceText = trip.preferences.map((pref) => `${pref.label} ${pref.value ?? ""} ${pref.category ?? ""}`).join(" ").toLowerCase();
+  const hasCapturedDiet = /\b(diet|dietary|gluten|gluten-free|vegan|vegetarian|halal|nut-free|lactose)\b/.test(capturedPreferenceText);
+  const hasCapturedMealRhythm = getMealTargetFromPreferences(trip.preferences) !== null;
+  const hasCriticalVisibleWidget = normalizedOpenUI.includes("conflictwarning") || normalizedOpenUI.includes("hoteloptions");
+  const hasPreferenceWidget =
+    normalizedOpenUI.includes("quickpreferences") ||
+    normalizedOpenUI.includes("preferenceoptions") ||
+    normalizedOpenUI.includes("suggestionchips");
+  const hasDietaryPreferenceWidget =
+    hasPreferenceWidget &&
+    /\b(diet|dietary|gluten|gluten-free|vegan|vegetarian|halal|nut-free|lactose|meal preferences|dietary requirements|ernaehrung|ernahrung|essen)\b/.test(
+      normalizedOpenUI,
+    );
+  const asksMealRhythm =
+    /\b(meal rhythm|how many meals|daily meals|meals per day|breakfast.*lunch.*dinner|3 meals|three meals|2 meals|two meals|mahlzeiten|fruehstueck|mittagessen|abendessen)\b/.test(
+      normalizedOpenUI,
+    );
+
+  if (hasCriticalVisibleWidget) return "";
+
+  if (hasCapturedMealRhythm && hasDietaryPreferenceWidget && asksMealRhythm) {
+    return "Duplicate meal-rhythm preference widget suppressed because meal rhythm is already captured.";
+  }
+
+  if (hasCapturedDiet && hasDietaryPreferenceWidget && !asksMealRhythm) {
+    return "Duplicate dietary preference widget suppressed because dietary constraints are already captured.";
+  }
+
+  return "";
+};
+
+const normalizePreferenceValue = (value: string) =>
+  normalizePlanningText(value)
+    .replace(/\b(gluten free|gluten-free|glutenfrei)\b/g, "gluten-free")
+    .replace(/\b(vegetarian|vegetarisch)\b/g, "vegetarian")
+    .replace(/\b(vegan)\b/g, "vegan")
+    .replace(/\b(halal)\b/g, "halal")
+    .replace(/\b(lactose free|lactose-free|laktosefrei)\b/g, "lactose-free")
+    .replace(/\b(nut free|nut-free|nussfrei)\b/g, "nut-free")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const getPreferenceSemanticKey = (pref: UserPreference) => {
+  const label = normalizePreferenceValue(pref.label);
+  const value = normalizePreferenceValue(pref.value ?? "");
+  const category = pref.category ?? "other";
+  const combined = `${label} ${value}`;
+
+  if (category === "diet" || /\b(diet|dietary|meal preference|meal preferences|dietary requirement|dietary requirements|ernaehrung|ernahrung|essen)\b/.test(combined)) {
+    const dietMatch = combined.match(/\b(gluten-free|vegetarian|vegan|halal|lactose-free|nut-free)\b/);
+    return dietMatch ? `diet:${dietMatch[1]}` : `diet:${value || label}`;
+  }
+
+  if (category === "transport" || /\b(lisboa card|public transport|transit|metro|bus|tram|train|taxi|taxis)\b/.test(combined)) {
+    return `transport:${value || label}`;
+  }
+
+  return `${category}:${label}:${value}`;
+};
+
+const dedupePreferences = (preferences: UserPreference[]) => {
+  const byKey = new Map<string, UserPreference>();
+  preferences.forEach((pref) => {
+    const key = getPreferenceSemanticKey(pref);
+    const existing = byKey.get(key);
+    if (!existing || existing.status !== "conflict" || pref.status === "conflict") {
+      byKey.set(key, pref);
+    }
+  });
+  return Array.from(byKey.values());
+};
+
+const mergePreferences = (existing: UserPreference[], incoming?: UserPreference[], userText = "") => {
   if (!incoming) return existing;
-  return incoming;
+  const dedupedIncoming = dedupePreferences(incoming);
+  const existingText = existing.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" ").toLowerCase();
+  const incomingText = dedupedIncoming.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" ").toLowerCase();
+  const normalizedUserText = normalizePlanningText(userText);
+  const hasExistingTransit = /\b(lisboa card|public transport|transit|metro|bus|tram|train)\b/.test(existingText);
+  const hasExistingTaxi = /\b(taxi|taxis)\b/.test(existingText);
+  const hasIncomingTransit = /\b(lisboa card|public transport|transit|metro|bus|tram|train)\b/.test(incomingText);
+  const hasIncomingTaxi = /\b(taxi|taxis)\b/.test(incomingText);
+  const resolvesToTaxi =
+    hasIncomingTaxi &&
+    /\b(resolve|prioritize|choose|use|replace|remove|instead|prefer|entscheide|priorisiere|nehme|nutze|ersetze|entferne|statt|lieber).{0,40}\b(taxi|taxis)\b|\b(taxi|taxis)\b.{0,40}\b(instead|over|rather than|statt|anstelle|lieber als)\b/.test(
+      normalizedUserText,
+    );
+  const resolvesToTransit =
+    hasIncomingTransit &&
+    /\b(resolve|prioritize|choose|use|replace|remove|instead|prefer|entscheide|priorisiere|nehme|nutze|ersetze|entferne|statt|lieber).{0,40}\b(lisboa card|public transport|transit|metro|bus|tram|train)\b|\b(lisboa card|public transport|transit|metro|bus|tram|train)\b.{0,40}\b(instead|over|rather than|statt|anstelle|lieber als)\b/.test(
+      normalizedUserText,
+    );
+
+  if (resolvesToTaxi || resolvesToTransit) {
+    return dedupedIncoming.filter((pref) => {
+      const text = `${pref.label} ${pref.value ?? ""}`.toLowerCase();
+      if (pref.status === "conflict") return false;
+      if (resolvesToTaxi) return !/\b(lisboa card|public transport|transit|metro|bus|tram|train)\b/.test(text);
+      return !/\b(taxi|taxis)\b/.test(text);
+    });
+  }
+
+  if (
+    (hasExistingTransit && hasIncomingTaxi) ||
+    (hasExistingTaxi && hasIncomingTransit) ||
+    (hasIncomingTransit && hasIncomingTaxi) ||
+    /\b(lisboa card|public transport).{0,20}(taxi|taxis)|(taxi|taxis).{0,20}(lisboa card|public transport)\b/.test(incomingText)
+  ) {
+    const cleaned = dedupedIncoming.filter((pref) => {
+      const text = `${pref.label} ${pref.value ?? ""}`.toLowerCase();
+      const isTransitPref = /\b(lisboa card|public transport|transit|metro|bus|tram|train)\b/.test(text);
+      const isTaxiPref = /\b(taxi|taxis)\b/.test(text);
+      if (pref.status === "conflict") return true;
+      if (hasExistingTransit && isTaxiPref) return false;
+      if (hasExistingTaxi && isTransitPref) return false;
+      if (!hasExistingTransit && !hasExistingTaxi && isTaxiPref) return false;
+      return true;
+    });
+    const transportBase = existing.filter((pref) => {
+      const text = `${pref.label} ${pref.value ?? ""}`.toLowerCase();
+      return /\b(lisboa card|public transport|transit|metro|bus|tram|train|taxi|taxis)\b/.test(text) && pref.status !== "conflict";
+    });
+    return dedupePreferences([
+      ...cleaned.filter((pref) => !transportBase.some((base) => normalizeTextKey(base.label) === normalizeTextKey(pref.label))),
+      ...transportBase,
+      {
+        label: "Transport preference conflict",
+        value: "Taxi travel conflicts with the current public transport/Lisboa Card preference",
+        category: "transport",
+        status: "conflict",
+      },
+    ]);
+  }
+
+  return dedupedIncoming;
+};
+
+const SWISS_NEIGHBOR_COUNTRIES = ["france", "germany", "austria", "italy", "liechtenstein"];
+
+const hasSwissNeighborExclusion = (preferences: UserPreference[]) => {
+  const text = normalizePlanningText(preferences.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" "));
+  return (
+    /\b(non-neighbor|non neighbouring|non-neighbouring|not neighboring|not neighbouring|outside switzerland'?s neighbors|exclude ch neighbors|exclude swiss neighbors|no swiss neighbors)\b/.test(text) ||
+    /\b(nachbarland|nachbarlaender|nachbarlander|angrenzend|grenzt an die schweiz|schweizer nachbarn|ch nachbarn)\b/.test(text)
+  );
+};
+
+const getRequestedSwissNeighbor = (patch: TripPatch, userText = "") => {
+  const text = normalizePlanningText(
+    [
+      patch.destination ?? "",
+      patch.status ?? "",
+      userText,
+      ...(patch.preferences ?? []).map((pref) => `${pref.label} ${pref.value ?? ""}`),
+    ].join(" "),
+  );
+  return SWISS_NEIGHBOR_COUNTRIES.find((country) => new RegExp(`\\b${country}\\b`, "i").test(text));
+};
+
+const hasExplicitNeighborResolution = (userText = "") => {
+  const text = normalizePlanningText(userText);
+  return /\b(remove|override|ignore|drop|lift|change|allow|accept|aufheben|streichen|ignorieren|aendern|andern|ändern|erlauben|trotzdem)\b.{0,60}\b(neighbor|neighbour|nachbarland|nachbarlaender|nachbarlander|schweiz|switzerland)\b/.test(text);
+};
+
+const applyPreferenceConflictGuards = (trip: TripState, patch: TripPatch, userText = ""): TripPatch => {
+  const requestedNeighbor = getRequestedSwissNeighbor(patch, userText);
+  if (!requestedNeighbor || !hasSwissNeighborExclusion(trip.preferences) || hasExplicitNeighborResolution(userText)) {
+    return patch;
+  }
+
+  const preferences = dedupePreferences([
+    ...(patch.preferences ?? trip.preferences),
+    {
+      label: "Destination preference conflict",
+      value: `${requestedNeighbor[0].toUpperCase()}${requestedNeighbor.slice(1)} conflicts with the current constraint to avoid Switzerland's neighboring countries`,
+      category: "destination",
+      status: "conflict",
+    },
+  ]);
+
+  return {
+    ...patch,
+    destination: trip.destination || undefined,
+    preferences,
+  };
 };
 
 const mergeDayPreservingLocalState = (existing: DayPlan | undefined, incoming: DayPlan): DayPlan => ({
@@ -1231,21 +1798,34 @@ const mergeDayPreservingLocalState = (existing: DayPlan | undefined, incoming: D
 
 const mergeDays = (existing: DayPlan[], incoming?: DayPlan[], focus?: FocusTarget | null) => {
   if (!incoming) return existing;
-  if (focus && existing.length) {
+  if (focus && focus.type !== "trip" && existing.length) {
     const incomingFocusDay = incoming.find((day) => day.day === focus.day);
     if (!incomingFocusDay) return existing;
     return existing.map((day) => (day.day === focus.day ? mergeDayPreservingLocalState(day, incomingFocusDay) : day));
   }
+  if (existing.length) {
+    const incomingByDay = new Map(incoming.map((day) => [day.day, day]));
+    const merged = existing.map((day) => {
+      const incomingDay = incomingByDay.get(day.day);
+      if (!incomingDay) return day;
+      incomingByDay.delete(day.day);
+      return mergeDayPreservingLocalState(day, incomingDay);
+    });
+    return [...merged, ...Array.from(incomingByDay.values()).sort((a, b) => a.day - b.day)];
+  }
   return incoming.map((day) => mergeDayPreservingLocalState(existing.find((existingDay) => existingDay.day === day.day), day));
 };
 
-const applyTripPatch = (trip: TripState, patch: TripPatch, focus?: FocusTarget | null): TripState => ({
-  ...trip,
-  ...patch,
-  currency: patch.currency ?? trip.currency ?? "CHF",
-  preferences: mergePreferences(trip.preferences, patch.preferences),
-  days: mergeDays(trip.days, patch.days, focus),
-});
+const applyTripPatch = (trip: TripState, patch: TripPatch, focus?: FocusTarget | null, userText = ""): TripState => {
+  const guardedPatch = applyPreferenceConflictGuards(trip, patch, userText);
+  return {
+    ...trip,
+    ...guardedPatch,
+    currency: guardedPatch.currency ?? trip.currency ?? "CHF",
+    preferences: mergePreferences(trip.preferences, guardedPatch.preferences, userText),
+    days: mergeDays(trip.days, guardedPatch.days, focus),
+  };
+};
 
 const markPatchDaysDraft = (patch: TripPatch): TripPatch => ({
   ...patch,
@@ -1301,6 +1881,8 @@ const getFocusedDayPatch = (existing: DayPlan | undefined, incoming: DayPlan, fo
 const preparePendingFocusPatch = (trip: TripState, patch: TripPatch, focus: FocusTarget, userText: string): TripPatch | undefined => {
   if (!patch.days?.length) return undefined;
 
+  if (focus.type === "trip") return preparePendingTripPatch(trip, patch);
+
   const broadRequest = isExplicitBroadFocusRequest(userText) || isBroadFocusRequest(userText);
   const candidateDays = broadRequest
     ? patch.days
@@ -1311,6 +1893,16 @@ const preparePendingFocusPatch = (trip: TripState, patch: TripPatch, focus: Focu
   const changedDays = candidateDays.filter((day) => isDayChanged(trip.days.find((existing) => existing.day === day.day), day));
   if (!changedDays.length) return undefined;
 
+  return {
+    ...patch,
+    days: changedDays,
+  };
+};
+
+const preparePendingTripPatch = (trip: TripState, patch: TripPatch): TripPatch | undefined => {
+  if (!patch.days?.length) return undefined;
+  const changedDays = patch.days.filter((day) => isDayChanged(trip.days.find((existing) => existing.day === day.day), day));
+  if (!changedDays.length) return undefined;
   return {
     ...patch,
     days: changedDays,
@@ -1377,11 +1969,18 @@ const callGeminiAPIStream = async (
   console.log("Complete history", contents);
   console.log("Request payload", requestPayload);
   console.groupEnd();
+  appendResearchConsoleEntry("api_request", `Condition ${condition} request ${requestId}`, {
+    requestId,
+    condition,
+    model: GEMINI_MODEL,
+    systemPrompt: fullSystemPrompt || null,
+    contents,
+  });
 
   appendEventIfAvailable(eventsRef, {
     type: "api_request",
     role: "system",
-    content: "Gemini request",
+    content: "VoyagerAI request",
     metadata: { requestId, condition, model: GEMINI_MODEL, systemPrompt: fullSystemPrompt || null, contents },
   });
 
@@ -1438,6 +2037,12 @@ const callGeminiAPIStream = async (
       console.groupCollapsed(`[VoyagerLab] Gemini raw response ${requestId} ${new Date().toLocaleTimeString()}`);
       console.log(rawResponse);
       console.groupEnd();
+      appendResearchConsoleEntry("api_response", `Condition ${condition} response ${requestId}`, {
+        requestId,
+        condition,
+        model: GEMINI_MODEL,
+        rawResponse,
+      });
 
       appendEventIfAvailable(eventsRef, {
         type: "api_response",
@@ -1456,10 +2061,15 @@ const callGeminiAPIStream = async (
         continue;
       }
 
-      const message = error instanceof Error ? error.message : "Unknown Gemini error";
+      const message = error instanceof Error ? error.message : "Unknown VoyagerAI error";
       console.error("[VoyagerLab] Gemini request failed", error);
+      appendResearchConsoleEntry("api_error", `Condition ${condition} request failed ${requestId}`, {
+        requestId,
+        condition,
+        error: serializeError(error),
+      });
       postClientLog({
-        type: "gemini_request_failed",
+        type: "voyagerai_request_failed",
         requestId,
         condition,
         error: serializeError(error),
@@ -1492,6 +2102,7 @@ const appendEventIfAvailable = (
 
 const postClientLog = (payload: Record<string, unknown>) => {
   if (typeof window === "undefined" || !window.location.protocol.startsWith("http")) return;
+  appendResearchConsoleEntry(String(payload.type || "client_log"), String(payload.message || payload.type || "client log"), payload);
   fetch("/api/client-log", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1637,8 +2248,11 @@ function ChatMessageRow({
     return (
       <div className="mb-4 flex items-end justify-end gap-2">
         {message.source === "ui_action" && <span className="pb-1 text-[10px] text-gray-400">via widget</span>}
-        <div className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm" style={{ background: T, maxWidth: "80%" }}>
-          {message.text}
+        <div className="flex max-w-[80%] flex-col items-end gap-1">
+          <div className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm" style={{ background: T }}>
+            {message.text}
+          </div>
+          <span className="pr-1 text-[10px] text-gray-400">{formatMessageTime(message.timestamp)}</span>
         </div>
       </div>
     );
@@ -1655,6 +2269,7 @@ function ChatMessageRow({
             <div className="prose prose-sm prose-slate max-w-none">
               <ReactMarkdown>{message.text}</ReactMarkdown>
             </div>
+            <div className="mt-2 text-right text-[10px] text-gray-400">{formatMessageTime(message.timestamp)}</div>
           </div>
         </div>
       )}
@@ -1741,8 +2356,19 @@ function ChatInputBar({ onSend, disabled }: { onSend: (message: string) => void;
 }
 
 // --- Right panel --------------------------------------------------------------
-function MetricsGrid({ trip, onExportTrip }: { trip: TripState; onExportTrip?: () => void }) {
+function MetricsGrid({
+  trip,
+  onExportTrip,
+  onRequestReviewFix,
+}: {
+  trip: TripState;
+  onExportTrip?: () => void;
+  onRequestReviewFix?: (issues: CoverageIssue[]) => void;
+}) {
   const metrics = metricCardsFromTrip(trip);
+  const [showReview, setShowReview] = useState(false);
+  const coverageIssues = computeCoverageIssues(trip);
+  const missingCount = coverageIssues.filter((issue) => issue.severity === "missing").length;
 
   return (
     <div className="flex-shrink-0 border-b border-gray-200" style={{ background: METRICS_BG }}>
@@ -1754,7 +2380,16 @@ function MetricsGrid({ trip, onExportTrip }: { trip: TripState; onExportTrip?: (
               Live Trip Performance
             </span>
           </div>
-          {onExportTrip && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowReview((value) => !value)}
+              className="flex items-center gap-1.5 rounded-lg border bg-white px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
+              style={{ borderColor: missingCount ? AMBER_BORDER : T_BORDER, color: missingCount ? AMBER : T }}
+            >
+              <ClipboardCheck className="h-3.5 w-3.5" />
+              Review Plan {missingCount ? `(${missingCount})` : ""}
+            </button>
+            {onExportTrip && (
             <button
               onClick={onExportTrip}
               className="flex items-center gap-1.5 rounded-lg border bg-white px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
@@ -1763,7 +2398,8 @@ function MetricsGrid({ trip, onExportTrip }: { trip: TripState; onExportTrip?: (
               <Download className="h-3.5 w-3.5" />
               Export Trip CSV
             </button>
-          )}
+            )}
+          </div>
         </div>
         <div className="grid grid-cols-3 gap-3">
           {metrics.map((metric) => (
@@ -1791,6 +2427,38 @@ function MetricsGrid({ trip, onExportTrip }: { trip: TripState; onExportTrip?: (
             </div>
           ))}
         </div>
+        {showReview && (
+          <div className="mt-3 rounded-2xl border bg-white px-4 py-3" style={{ borderColor: coverageIssues.length ? AMBER_BORDER : GREEN_BORDER }}>
+            <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest" style={{ color: coverageIssues.length ? AMBER : GREEN }}>
+              <ClipboardCheck className="h-3.5 w-3.5" />
+              Plan completeness review
+            </div>
+            {coverageIssues.length === 0 ? (
+              <p className="text-xs font-semibold text-green-700">No local coverage gaps detected.</p>
+            ) : (
+              <div>
+                <div className="grid max-h-36 gap-1.5 overflow-y-auto pr-1">
+                  {coverageIssues.slice(0, 10).map((issue) => (
+                    <div key={issue.id} className="rounded-lg px-2 py-1.5 text-xs" style={{ background: issue.severity === "missing" ? AMBER_LIGHT : "#F8FAFC", color: "#334155" }}>
+                      <span className="font-semibold">{issue.label}</span>
+                      <span className="text-slate-500"> - {issue.detail}</span>
+                    </div>
+                  ))}
+                  {coverageIssues.length > 10 && <div className="text-xs font-semibold text-slate-400">+{coverageIssues.length - 10} more checks</div>}
+                </div>
+                {onRequestReviewFix && (
+                  <button
+                    onClick={() => onRequestReviewFix(coverageIssues)}
+                    className="mt-3 rounded-lg px-3 py-1.5 text-xs font-bold text-white transition hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-amber-200"
+                    style={{ background: AMBER }}
+                  >
+                    Ask VoyagerAI to resolve gaps
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1876,16 +2544,22 @@ function ItineraryArtifact({
   trip,
   focus,
   pendingEdit,
+  completionWarning,
+  disabledActions,
   onSetFocus,
   onToggleDayComplete,
+  onRequestDayCompletionFix,
   onAcceptPendingDay,
   onRejectPendingDay,
 }: {
   trip: TripState;
   focus: FocusTarget | null;
   pendingEdit: PendingEdit | null;
+  completionWarning: CompletionWarning | null;
+  disabledActions?: boolean;
   onSetFocus: (focus: FocusTarget) => void;
   onToggleDayComplete: (day: number) => void;
+  onRequestDayCompletionFix: (day: number, issues: CoverageIssue[]) => void;
   onAcceptPendingDay: PendingDayAction;
   onRejectPendingDay: PendingDayAction;
 }) {
@@ -1935,10 +2609,12 @@ function ItineraryArtifact({
         const isOpen = expanded === day.day;
         const fallbackNightlyCost = extractNightlyCostFromPreferences(trip.preferences);
         const dayCost = computeDayCost(day, fallbackNightlyCost);
-        const isDayFocused = focus?.day === day.day;
+        const isDayFocused = focus?.type !== "trip" && focus?.day === day.day;
         const pendingDay = pendingEdit?.patch.days?.find((candidate) => candidate.day === day.day);
         const locationLabel = day.location || day.city || trip.destination;
         const hotelLabel = day.hotel?.name || (fallbackNightlyCost ? "Selected accommodation" : "");
+        const dayCompletionIssues = getBlockingDayCompletionIssues(trip, day.day);
+        const activeCompletionWarning = completionWarning?.day === day.day ? completionWarning : null;
         return (
           <div
             key={day.day}
@@ -1985,6 +2661,30 @@ function ItineraryArtifact({
                   />
                 )}
                 {day.summary && <p className="mb-3 rounded-xl bg-white px-3 py-2 text-xs leading-relaxed text-gray-500">{day.summary}</p>}
+                {activeCompletionWarning && (
+                  <div className="mb-3 rounded-2xl border px-4 py-3 text-xs" style={{ background: AMBER_LIGHT, borderColor: AMBER_BORDER, color: "#92400E" }}>
+                    <div className="mb-2 flex items-center gap-2 font-bold uppercase tracking-widest" style={{ color: AMBER }}>
+                      <AlertTriangle className="h-3.5 w-3.5" />
+                      Completion blocked
+                    </div>
+                    <div className="grid gap-1">
+                      {activeCompletionWarning.issues.slice(0, 5).map((issue) => (
+                        <div key={issue.id}>
+                          <span className="font-semibold">{issue.label}</span>
+                          <span className="text-slate-500"> - {issue.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <button
+                      disabled={disabledActions}
+                      onClick={() => onRequestDayCompletionFix(day.day, activeCompletionWarning.issues)}
+                      className="mt-3 rounded-lg px-3 py-1.5 text-xs font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ background: AMBER }}
+                    >
+                      Ask VoyagerAI to complete Day {day.day}
+                    </button>
+                  </div>
+                )}
 
                 <div className="mb-3 space-y-2">
                   {day.hotel && (
@@ -1997,7 +2697,13 @@ function ItineraryArtifact({
                         <div className="text-sm font-medium text-slate-700">{day.hotel.name}</div>
                         <div className="text-xs text-gray-400">{[day.hotel.tier, day.hotel.city].filter(Boolean).join(" - ")}</div>
                       </div>
-                      {typeof day.hotel.pricePerNight === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(day.hotel.pricePerNight, trip.currency)}</span>}
+                      {typeof day.hotel.pricePerNight === "number" ? (
+                        <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(day.hotel.pricePerNight, trip.currency)}</span>
+                      ) : (
+                        <span className="flex-shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
+                          Missing cost
+                        </span>
+                      )}
                       <button
                         onClick={() => onSetFocus({ type: "hotel", day: day.day, label: `Editing Day ${day.day} hotel` })}
                         className="flex-shrink-0 rounded-lg border bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-teal-200"
@@ -2009,10 +2715,31 @@ function ItineraryArtifact({
                   )}
                   {day.activities.map((activity, index) => (
                     <div key={`${activity.time}-${activity.name}-${index}`} className="flex items-start gap-3 rounded-xl bg-white px-3 py-2" style={activity.changed ? { background: GREEN_LIGHT } : undefined}>
-                      <span className="mt-0.5 w-20 flex-shrink-0 font-mono text-[10px] text-gray-400">{activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : activity.time || "--:--"}</span>
+                      <span className="mt-0.5 w-20 flex-shrink-0 font-mono text-[10px]" style={{ color: activity.endTime ? "#9CA3AF" : AMBER }}>
+                        {activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : `${activity.time || "--:--"}-?`}
+                      </span>
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-medium" style={{ color: activity.changed ? GREEN : "#374151" }}>{activity.name}</div>
                         {activity.note && <div className="text-xs text-gray-400">{activity.note}</div>}
+                        {(!activity.endTime || typeof activity.cost !== "number" || hasSparseActionableDetail(activity)) && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {!activity.endTime && (
+                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
+                                Missing end time
+                              </span>
+                            )}
+                            {typeof activity.cost !== "number" && (
+                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
+                                Missing cost
+                              </span>
+                            )}
+                            {hasSparseActionableDetail(activity) && (
+                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
+                                Needs detail
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
                       {typeof activity.cost === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(activity.cost, trip.currency)}</span>}
                       <button
@@ -2044,7 +2771,7 @@ function ItineraryArtifact({
                     style={day.completed ? { background: GREEN, color: "white" } : { border: `1.5px solid ${GREEN}`, color: GREEN, background: "white" }}
                   >
                     <Check className="h-3.5 w-3.5" />
-                    {day.completed ? "Completed" : "Mark day complete"}
+                    {day.completed ? "Completed" : dayCompletionIssues.length ? `Complete blocked (${dayCompletionIssues.length})` : "Mark day complete"}
                   </button>
                   <button
                     onClick={(event) => {
@@ -2148,6 +2875,7 @@ class AppErrorBoundary extends React.Component<
 
 function AppShell() {
   const [sessionActive, setSessionActive] = useState(false);
+  const [consoleMode, setConsoleMode] = useState(() => typeof window !== "undefined" && window.location.hash === "#console");
   const [state, setState] = useState<S>({
     condition: "B",
     participantId: "",
@@ -2172,6 +2900,7 @@ function AppShell() {
   };
 
   useEffect(() => {
+    const handleHashChange = () => setConsoleMode(window.location.hash === "#console");
     const handleError = (event: ErrorEvent) => {
       postClientLog({
         type: "window_error",
@@ -2189,13 +2918,17 @@ function AppShell() {
       });
     };
 
+    window.addEventListener("hashchange", handleHashChange);
     window.addEventListener("error", handleError);
     window.addEventListener("unhandledrejection", handleUnhandledRejection);
     return () => {
+      window.removeEventListener("hashchange", handleHashChange);
       window.removeEventListener("error", handleError);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
     };
   }, []);
+
+  if (consoleMode) return <ResearchConsoleScreen onBack={() => { window.location.hash = ""; setConsoleMode(false); }} />;
 
   return (
     <div className="flex h-screen flex-col overflow-hidden" style={{ fontFamily: "'Inter', sans-serif", background: "#F1F3F6" }}>
@@ -2217,6 +2950,99 @@ export default function App() {
     <AppErrorBoundary>
       <AppShell />
     </AppErrorBoundary>
+  );
+}
+
+function ResearchConsoleScreen({ onBack }: { onBack: () => void }) {
+  const [entries, setEntries] = useState<ResearchConsoleEntry[]>([]);
+  const [selectedType, setSelectedType] = useState("all");
+
+  const loadEntries = () => {
+    try {
+      setEntries(JSON.parse(window.localStorage.getItem(RESEARCH_CONSOLE_KEY) || "[]") as ResearchConsoleEntry[]);
+    } catch {
+      setEntries([]);
+    }
+  };
+
+  useEffect(() => {
+    loadEntries();
+    const handleLog = () => loadEntries();
+    const interval = window.setInterval(loadEntries, 1500);
+    window.addEventListener("storage", handleLog);
+    window.addEventListener("voyagerlab-console-log", handleLog);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("storage", handleLog);
+      window.removeEventListener("voyagerlab-console-log", handleLog);
+    };
+  }, []);
+
+  const types = ["all", ...Array.from(new Set(entries.map((entry) => entry.type))).sort()];
+  const visibleEntries = selectedType === "all" ? entries : entries.filter((entry) => entry.type === selectedType);
+
+  return (
+    <div className="flex h-full flex-col bg-slate-950 text-slate-100" style={{ fontFamily: "'Inter', sans-serif" }}>
+      <div className="flex flex-shrink-0 items-center justify-between border-b border-slate-800 px-5 py-3">
+        <div className="flex items-center gap-2">
+          <Terminal className="h-4 w-4" style={{ color: T_BORDER }} />
+          <span className="text-sm font-bold">VoyagerLab Research Console</span>
+          <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-semibold text-slate-400">{entries.length} events</span>
+        </div>
+        <button onClick={onBack} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-slate-800">
+          Back to setup
+        </button>
+      </div>
+      <div className="flex flex-shrink-0 flex-wrap items-center gap-2 border-b border-slate-800 px-5 py-3">
+        {types.map((type) => (
+          <button
+            key={type}
+            onClick={() => setSelectedType(type)}
+            className="rounded-full border px-3 py-1 text-xs font-semibold transition"
+            style={{
+              borderColor: selectedType === type ? T_BORDER : "#334155",
+              background: selectedType === type ? T : "transparent",
+              color: selectedType === type ? "white" : "#CBD5E1",
+            }}
+          >
+            {type}
+          </button>
+        ))}
+        <button
+          onClick={() => {
+            window.localStorage.removeItem(RESEARCH_CONSOLE_KEY);
+            setEntries([]);
+          }}
+          className="ml-auto rounded-lg border border-red-900 px-3 py-1 text-xs font-semibold text-red-300 transition hover:bg-red-950"
+        >
+          Clear console
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+        {visibleEntries.length === 0 ? (
+          <div className="rounded-2xl border border-slate-800 bg-slate-900 px-5 py-8 text-center text-sm text-slate-400">
+            No console events yet. Keep this tab open while running a participant session in another tab.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {visibleEntries.slice().reverse().map((entry) => (
+              <div key={entry.id} className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-teal-200">{entry.type}</span>
+                  <span className="text-xs text-slate-500">{new Date(entry.timestamp).toLocaleString()}</span>
+                  <span className="text-sm font-semibold text-slate-200">{entry.summary}</span>
+                </div>
+                {entry.payload !== undefined && (
+                  <pre className="max-h-72 overflow-auto rounded-xl bg-slate-950 p-3 text-xs leading-relaxed text-slate-300">
+                    {JSON.stringify(entry.payload, null, 2)}
+                  </pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2245,6 +3071,14 @@ function SetupScreen({ state, update, onLaunch }: { state: S; update: StateUpdat
           <span className="text-sm font-bold text-gray-700">VoyagerLab Research Console</span>
         </div>
         <div className="flex items-center gap-4">
+          <button
+            onClick={() => window.open(`${window.location.pathname}${window.location.search}#console`, "_blank", "noopener,noreferrer")}
+            className="flex items-center gap-1.5 rounded-lg border bg-white px-2.5 py-1.5 text-xs font-semibold transition hover:bg-slate-50"
+            style={{ borderColor: T_BORDER, color: T }}
+          >
+            <Terminal className="h-3.5 w-3.5" />
+            Console
+          </button>
           <label className="flex items-center gap-2">
             <span className="text-xs text-gray-500">Participant ID:</span>
             <input
@@ -2469,6 +3303,7 @@ function ConditionBScreen({
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
+  const [completionWarning, setCompletionWarning] = useState<CompletionWarning | null>(null);
   const messagesRef = useRef<Message[]>([]);
   const stateRef = useRef(state);
   const eventsRef = useRef<SessionEvent[]>([]);
@@ -2496,10 +3331,10 @@ function ConditionBScreen({
     });
   }, [messages, state.focus]);
 
-  const applyOpenUITripPatch = (patch: TripPatch, messageId: string, focusOverride?: FocusTarget | null) => {
+  const applyOpenUITripPatch = (patch: TripPatch, messageId: string, focusOverride?: FocusTarget | null, userText = "") => {
     updateState((previous) => ({
       ...previous,
-      trip: applyTripPatch(previous.trip, patch, focusOverride === undefined ? previous.focus : focusOverride),
+      trip: applyTripPatch(previous.trip, patch, focusOverride === undefined ? previous.focus : focusOverride, userText),
     }));
     appendEvent(eventsRef, {
       type: "state_update",
@@ -2575,7 +3410,25 @@ function ConditionBScreen({
             metadata: { errors, openUI: finalOpenUI },
           });
         } else {
-          renderableOpenUI = finalOpenUI;
+          const suppressionReason = getOpenUISuppressionReason(finalOpenUI, stateRef.current.trip);
+          if (suppressionReason) {
+            console.info("[VoyagerLab] OpenUI widget suppressed", suppressionReason, finalOpenUI);
+            postClientLog({
+              type: "openui_widget_suppressed",
+              messageId: aiMsgId,
+              reason: suppressionReason,
+              openUI: finalOpenUI,
+            });
+            appendEvent(eventsRef, {
+              type: "state_update",
+              role: "system",
+              messageId: aiMsgId,
+              content: suppressionReason,
+              metadata: { openUI: finalOpenUI },
+            });
+          } else {
+            renderableOpenUI = finalOpenUI;
+          }
           patchToApply = patch;
         }
       } else if (finalParsed.malformedOpenUI) {
@@ -2617,7 +3470,7 @@ function ConditionBScreen({
         if (activeFocus && patchToApply.days?.length) {
           const pendingPatch = preparePendingFocusPatch(stateRef.current.trip, patchToApply, activeFocus, text);
           if (pendingPatch?.days?.length) {
-            setPendingEdit({ id: makeId(), messageId: aiMsgId, patch: pendingPatch, focus: activeFocus });
+            setPendingEdit({ id: makeId(), messageId: aiMsgId, patch: pendingPatch, focus: activeFocus, userText: text });
             appendEvent(eventsRef, {
               type: "state_update",
               role: "system",
@@ -2634,7 +3487,7 @@ function ConditionBScreen({
           } else {
             const nonItineraryPatch: TripPatch = { ...patchToApply, days: undefined };
             if (Object.keys(nonItineraryPatch).some((key) => key !== "days" && nonItineraryPatch[key as keyof TripPatch] !== undefined)) {
-              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null);
+              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text);
               postClientLog({
                 type: "state_patch_applied_without_itinerary_changes",
                 messageId: aiMsgId,
@@ -2643,8 +3496,42 @@ function ConditionBScreen({
               });
             }
           }
+        } else if (patchToApply.days?.length && stateRef.current.trip.days.length) {
+          const pendingPatch = preparePendingTripPatch(stateRef.current.trip, patchToApply);
+          if (pendingPatch?.days?.length) {
+            setPendingEdit({
+              id: makeId(),
+              messageId: aiMsgId,
+              patch: { ...patchToApply, days: pendingPatch.days },
+              focus: { type: "trip", label: "Reviewing itinerary changes" },
+              userText: text,
+            });
+            appendEvent(eventsRef, {
+              type: "state_update",
+              role: "system",
+              messageId: aiMsgId,
+              content: "Itinerary patch held for review",
+              metadata: { patch: { ...patchToApply, days: pendingPatch.days } },
+            });
+            postClientLog({
+              type: "state_patch_pending_review",
+              messageId: aiMsgId,
+              patch: { ...patchToApply, days: pendingPatch.days },
+              focus: { type: "trip", label: "Reviewing itinerary changes" },
+            });
+          } else {
+            const nonItineraryPatch: TripPatch = { ...patchToApply, days: undefined };
+            if (Object.keys(nonItineraryPatch).some((key) => key !== "days" && nonItineraryPatch[key as keyof TripPatch] !== undefined)) {
+              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text);
+              postClientLog({
+                type: "state_patch_applied_without_itinerary_changes",
+                messageId: aiMsgId,
+                patch: nonItineraryPatch,
+              });
+            }
+          }
         } else {
-          applyOpenUITripPatch(patchToApply, aiMsgId);
+          applyOpenUITripPatch(patchToApply, aiMsgId, undefined, text);
           postClientLog({
             type: "state_patch_applied",
             messageId: aiMsgId,
@@ -2717,8 +3604,9 @@ function ConditionBScreen({
     if (!pendingEdit) return;
     const day = pendingEdit.patch.days?.find((candidate) => candidate.day === dayNumber);
     if (!day) return;
-    const patch = markPatchDaysDraft({ ...pendingEdit.patch, days: [day] });
-    applyOpenUITripPatch(patch, pendingEdit.messageId, null);
+    const isLastPendingDay = (pendingEdit.patch.days?.length ?? 0) === 1;
+    const patch = markPatchDaysDraft(isLastPendingDay ? { ...pendingEdit.patch, days: [day] } : { days: [day] });
+    applyOpenUITripPatch(patch, pendingEdit.messageId, null, pendingEdit.userText ?? "");
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
@@ -2743,6 +3631,26 @@ function ConditionBScreen({
   };
 
   const toggleDayComplete = (dayNumber: number) => {
+    const currentDay = stateRef.current.trip.days.find((day) => day.day === dayNumber);
+    const blockingIssues = getBlockingDayCompletionIssues(stateRef.current.trip, dayNumber);
+    if (currentDay && !currentDay.completed && blockingIssues.length) {
+      setCompletionWarning({ day: dayNumber, issues: blockingIssues });
+      appendEvent(eventsRef, {
+        type: "ui_action",
+        role: "user",
+        source: "itinerary_complete_blocked",
+        content: `Completion blocked for Day ${dayNumber}`,
+        metadata: { day: dayNumber, issues: blockingIssues },
+      });
+      postClientLog({
+        type: "day_completion_blocked",
+        day: dayNumber,
+        issues: blockingIssues,
+      });
+      return;
+    }
+
+    setCompletionWarning((current) => (current?.day === dayNumber ? null : current));
     let nextCompleted = false;
     updateState((previous) => {
       const days = previous.trip.days.map((day) => {
@@ -2804,6 +3712,35 @@ function ConditionBScreen({
     generateTripCSVAndDownload(stateRef.current);
   };
 
+  const handleRequestReviewFix = (issues: CoverageIssue[]) => {
+    if (isLoading) return;
+    const message = formatCoverageReviewMessage(issues);
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "plan_review",
+      content: "Ask VoyagerAI to resolve local completeness gaps",
+      metadata: { issues },
+    });
+    void handleSend(message, "ui_action");
+  };
+
+  const handleRequestDayCompletionFix = (dayNumber: number, issues: CoverageIssue[]) => {
+    if (isLoading) return;
+    const message = formatDayCompletionReviewMessage(dayNumber, issues);
+    const focus: FocusTarget = { type: "day", day: dayNumber, label: `Editing Day ${dayNumber}` };
+    setPendingEdit(null);
+    updateState({ focus });
+    appendEvent(eventsRef, {
+      type: "ui_action",
+      role: "user",
+      source: "day_completion_review",
+      content: `Ask VoyagerAI to complete Day ${dayNumber}`,
+      metadata: { day: dayNumber, issues, focus },
+    });
+    void handleSend(message, "ui_action");
+  };
+
   const lastMessageId = messages[messages.length - 1]?.id;
 
   return (
@@ -2837,14 +3774,17 @@ function ConditionBScreen({
       </div>
 
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
-        <MetricsGrid trip={state.trip} onExportTrip={handleExportTrip} />
+        <MetricsGrid trip={state.trip} onExportTrip={handleExportTrip} onRequestReviewFix={handleRequestReviewFix} />
         <div className="relative min-h-0 flex-1 overflow-y-auto px-8">
           <ItineraryArtifact
             trip={state.trip}
             focus={state.focus}
             pendingEdit={pendingEdit}
+            completionWarning={completionWarning}
+            disabledActions={isLoading}
             onSetFocus={setEditFocus}
             onToggleDayComplete={toggleDayComplete}
+            onRequestDayCompletionFix={handleRequestDayCompletionFix}
             onAcceptPendingDay={acceptPendingDay}
             onRejectPendingDay={rejectPendingDay}
           />
