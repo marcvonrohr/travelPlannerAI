@@ -195,11 +195,6 @@ type CoverageSummary = {
   affectedDays: number[];
 };
 
-type CompletionWarning = {
-  day: number;
-  issues: CoverageIssue[];
-};
-
 type ResearchConsoleEntry = {
   id: string;
   timestamp: string;
@@ -367,14 +362,30 @@ const QuickPreferencesComponent = defineComponent({
   component: ({ props }) => {
     const triggerAction = useTriggerAction();
     const isStreaming = useIsStreaming();
-    const dietary = props.dietary ?? [];
-    const tiers = props.accommodationTiers ?? [];
+    const dietary = (props.dietary ?? []).filter((item) => item.label.trim());
+    const tiers = (props.accommodationTiers ?? []).filter((tier) => tier.trim());
+    const numericPrices = [props.minPrice, props.maxPrice, props.selectedPrice].filter(
+      (value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0,
+    );
+    const sortedPrices = numericPrices.length ? [...numericPrices].sort((a, b) => a - b) : [];
+    const normalizedMinPrice = sortedPrices[0];
+    const normalizedMaxPrice = sortedPrices.length ? sortedPrices[sortedPrices.length - 1] : undefined;
+    const selectedPriceCandidate =
+      typeof props.selectedPrice === "number" && Number.isFinite(props.selectedPrice) && props.selectedPrice > 0
+        ? props.selectedPrice
+        : normalizedMaxPrice ?? normalizedMinPrice;
+    const hasPlausiblePrice =
+      typeof normalizedMinPrice === "number" &&
+      typeof normalizedMaxPrice === "number" &&
+      normalizedMinPrice < 1000 &&
+      normalizedMaxPrice < 1000 &&
+      !(normalizedMinPrice === normalizedMaxPrice && normalizedMinPrice >= 500);
     const hasDietary = dietary.length > 0;
-    const hasAccommodation = tiers.length > 0 || props.selectedTier || props.minPrice || props.maxPrice || props.selectedPrice;
+    const hasAccommodation = tiers.length > 0 || Boolean(props.selectedTier?.trim()) || hasPlausiblePrice;
     const currency = props.currency || "CHF";
     const [selectedDietary, setSelectedDietary] = useState<string[]>(() => dietary.filter((item) => item.selected).map((item) => item.label));
     const [selectedTier, setSelectedTier] = useState(props.selectedTier ?? "");
-    const [selectedPrice, setSelectedPrice] = useState<number | undefined>(props.selectedPrice);
+    const [selectedPrice, setSelectedPrice] = useState<number | undefined>(hasPlausiblePrice ? selectedPriceCandidate : undefined);
 
     if (!hasDietary && !hasAccommodation) return null;
 
@@ -385,7 +396,7 @@ const QuickPreferencesComponent = defineComponent({
       const parts = [
         selectedDietary.length ? `dietary preferences: ${selectedDietary.join(", ")}` : "",
         selectedTier ? `accommodation tier: ${selectedTier}` : "",
-        selectedPrice ? `accommodation budget: about ${selectedPrice} ${currency} per night` : "",
+        selectedPrice ? `accommodation budget: about ${formatMoney(selectedPrice, currency)} per night` : "",
       ].filter(Boolean);
       if (parts.length) triggerAction(`My selected preferences are ${parts.join("; ")}.`);
     };
@@ -445,14 +456,14 @@ const QuickPreferencesComponent = defineComponent({
                   })}
                 </div>
               )}
-              {(props.minPrice || props.maxPrice || props.selectedPrice) && (
+              {hasPlausiblePrice && (
                 <button
                   disabled={isStreaming}
-                  onClick={() => setSelectedPrice((current) => (current ? undefined : props.selectedPrice ?? props.maxPrice ?? props.minPrice))}
+                  onClick={() => setSelectedPrice((current) => (current ? undefined : selectedPriceCandidate))}
                   className="w-full rounded-lg border bg-white px-3 py-2 text-left text-xs font-semibold transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                   style={{ background: selectedPrice ? T_LIGHT : "white", borderColor: T_BORDER, color: T }}
                 >
-                  ~{props.minPrice ?? 0}-{props.maxPrice ?? props.selectedPrice ?? 0} {currency}/night
+                  ~{normalizedMinPrice}-{normalizedMaxPrice} {currency}/night
                 </button>
               )}
             </div>
@@ -658,7 +669,10 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "You are a Socratic travel-planning assistant that can answer in concise English prose and append OpenUI Lang code for interactive UI widgets.",
   additionalRules: [
     "Use English for all prose and UI labels.",
-    "After the user provides 3-4 basics (destination or region, budget, duration, travelers), stop asking broad setup questions and propose a first high-level route.",
+    "Follow the phased Socratic workflow: Phase 1 macro profile and route topology, Phase 2 basecamp and hard logistics, Phase 3 risk/health/dietary protections, Phase 4 one-day-at-a-time micro planning, Phase 5 audit, Phase 6 final artifact.",
+    "Do not generate a complete itinerary in the initial turns. After the user provides destination or region, budget, duration, and travelers, propose only a high-level route topology or next phase decision, not a finished day-by-day plan.",
+    "Track the active phase in StateUpdate.status using labels such as phase_1_route_topology, phase_2_basecamp_logistics, phase_3_risk_health, phase_4_daily_planning, phase_5_audit, or phase_6_final.",
+    "Phases are hidden internal planning state. Never mention phase numbers, phase names, or phase_ labels in prose or visible UI labels.",
     "Ask at most one focused Socratic question at a time before the first route is proposed.",
     "In the first 2-3 assistant turns, keep widgets sparse. Prefer text-first Socratic questioning and use at most one small widget only if it supports the single question being asked.",
     "For vague starts like \"I want to travel\", ask one destination or region question instead of offering many predefined trip concepts.",
@@ -676,7 +690,9 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Generic conflict patterns: requested destination conflicts with an excluded region; a new dietary need conflicts with planned restaurants; a new activity exceeds budget or available time.",
     "When adding a new constraint after an itinerary exists, review the current itinerary and surface any conflicts one at a time with ConflictWarning.",
     "When proposing a high-level route, include StateUpdate.days so the right-side Itinerary can render. Do not put itinerary days only in prose.",
+    "When one day is planned or revised, immediately include that day in StateUpdate.days; do not wait for the full trip to be complete.",
     "For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.",
+    "Never set completed true in StateUpdate.days. Completion is controlled only by the local Complete day button.",
     "When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.",
     "Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.",
     "Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.",
@@ -692,6 +708,8 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.",
     "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
     "Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.",
+    "For QuickPreferences, omit dietary entirely unless you provide non-empty dietary option labels.",
+    "For QuickPreferences accommodation prices, use realistic nightly prices only, with minPrice <= maxPrice. Never use the total trip budget as a nightly accommodation range.",
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
@@ -708,9 +726,16 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
 
 // --- Prompts and context ------------------------------------------------------
 const SOCRATIC_COMPLETION_CONTRACT = `Socratic completion contract:
-- Work in phases: 1) basics, 2) route shape, 3) lodging, 4) meal rhythm and dietary fit, 5) transport, 6) daily activities, 7) review and conflict resolution.
+- Work in phases: 1) macro profile and route topology, 2) basecamp and hard logistics, 3) bureaucracy/risk/health/dietary protections, 4) one-day-at-a-time micro planning, 5) spatial/temporal/budget audit, 6) final artifact release.
+- Phase 1 locks dates or duration, budget ceiling, traveler count, trip purpose, route topology, single-stop versus multi-stop, pacing, and arrival/return inclusion preference.
+- Phase 2 locks basecamp/lodging and hard transport chains for each stop before detailed activities are scheduled.
+- Phase 3 elicits health, dietary, administrative, insurance, cancellation, and risk requirements before daily scheduling.
+- Phase 4 plans exactly one active day at a time, chronologically, with transport, meals, activities, rest, itemized prices, start/end times, and practical instructions.
+- Phase 5 validates feasibility across the compiled trip and negotiates conflicts explicitly.
+- Phase 6 releases the final structured itinerary only after explicit user approval.
 - Never treat the plan as complete while the local coverage issues indicate missing meals, missing transport, missing lodging, missing numeric costs, missing end times, missing arrival/return decisions, or sparse activity details.
 - At the start of every turn, review the current hidden itinerary state for flaws, contradictions, missing implementation detail, missing costs, missing meals, missing transport, and arrival/return gaps. Use that review together with the user's latest request to decide the best next step.
+- When the user or UI asks to validate feasibility, audit whether a traveler could follow the plan blind from A to B. If not, ask one Socratic question if a decision is missing; otherwise propose concrete StateUpdate.days fixes.
 - If the user changes the route shape materially, such as adding another region or replacing the destination focus, restart the affected future segment Socratically instead of patching one token. Ask which existing days should be repurposed, then propose revised affected days via StateUpdate.days.
 - When hidden routeChangeIntent is present, do not answer only in prose. If affected days are unclear, ask one question about the segment to repurpose; if they are clear, propose revised StateUpdate.days only for those days and preserve earlier accepted days.
 - If the user expresses a preference that conflicts with an active preference, keep the existing preference unless the user explicitly resolves the conflict. Use ConflictWarning or a conflict preference status instead of silently merging incompatible preferences.
@@ -722,7 +747,10 @@ const SYSTEM_PROMPT_B = `You are the experimental Socratic Planner for a travel-
 Behavior rules:
 - You are a maieutic guide, not a zero-shot itinerary generator.
 - Your purpose is to elicit missing constraints, expose trade-offs, and help the user co-create the itinerary.
-- Do not ask endless setup questions. Once destination or region, budget, duration, and travelers are known or strongly implied, propose a first route.
+- Follow the mandatory phased workflow: Phase 1 macro profile and route topology, Phase 2 basecamp and hard logistics, Phase 3 risk/health/dietary protections, Phase 4 one-day-at-a-time micro planning, Phase 5 audit, Phase 6 final artifact.
+- Do not generate a complete itinerary in the initial turns. Once destination or region, budget, duration, and travelers are known or strongly implied, propose only a high-level route topology or next phase decision, not a finished day-by-day plan.
+- Track the active phase in StateUpdate.status using labels such as phase_1_route_topology, phase_2_basecamp_logistics, phase_3_risk_health, phase_4_daily_planning, phase_5_audit, or phase_6_final.
+- Phases are hidden internal planning state. Never mention phase numbers, phase names, or phase_ labels in prose or visible UI labels.
 - In the first 2-3 assistant turns, keep quick replies sparse and never replace the user's own reflection with a large menu of choices.
 - For vague openings, ask one focused question; for concrete constraints such as gluten-free food and Japan, capture them immediately in StateUpdate.
 - For a pure greeting or vague opening with no concrete travel information, respond with text only; do not output OpenUI and do not send an empty StateUpdate.
@@ -738,7 +766,9 @@ Behavior rules:
 - Generic conflict patterns: requested destination conflicts with an excluded region; a new dietary need conflicts with planned restaurants; a new activity exceeds budget or available time.
 - When adding a new constraint after an itinerary exists, review the current itinerary and surface any conflicts one at a time with ConflictWarning.
 - When proposing a high-level route, include StateUpdate.days so the right-side Itinerary can render. Do not put itinerary days only in prose.
+- When one day is planned or revised, immediately include that day in StateUpdate.days; do not wait for the full trip to be complete.
 - For every planned day, include location or city, hotel when selected, approximate spend, completed false, and activities with start time and approximate endTime.
+- Never set completed true in StateUpdate.days. Completion is controlled only by the local Complete day button.
 - When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.
 - Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.
 - Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.
@@ -753,6 +783,8 @@ Behavior rules:
 - Every activity must include a numeric cost. Use 0 for free sights, realistic average prices for meals, and estimated fares for transport.
 - Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.
 - Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.
+- For QuickPreferences, omit dietary entirely unless you provide non-empty dietary option labels.
+- For QuickPreferences accommodation prices, use realistic nightly prices only, with minPrice <= maxPrice. Never use the total trip budget as a nightly accommodation range.
 - When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.
 - Keep chat prose concise, but make the structured trip state complete.
 - Preserve all known user preferences and constraints in the hidden StateUpdate so the dashboard remains reliable.
@@ -1119,6 +1151,8 @@ const formatMessageTime = (timestamp: string) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+const isInternalPhaseStatus = (status?: string) => Boolean(status && /^phase[_\s-]?\d|^phase_/i.test(status.trim()));
+
 const normalizeTextKey = (value: string) => value.trim().toLowerCase();
 
 const RESEARCH_CONSOLE_KEY = "voyagerlab:research-console";
@@ -1401,7 +1435,7 @@ const metricCardsFromTrip = (trip: TripState) => {
 
 const formatCoverageReviewMessage = (issues: CoverageIssue[]) => {
   if (!issues.length) {
-    return "Please review the current itinerary for completeness and tell me if anything important is still missing before I mark more days complete.";
+    return "Please validate the current trip feasibility. Check whether a traveler could follow the plan from start to finish without hidden assumptions. If anything material is missing, ask one Socratic question or propose a concrete StateUpdate patch. Do not mark any day completed.";
   }
 
   const issueLines = issues
@@ -1409,16 +1443,20 @@ const formatCoverageReviewMessage = (issues: CoverageIssue[]) => {
     .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
     .join("\n");
 
-  return `Please review the current itinerary against these local completeness gaps and help me resolve them step by step. Ask one Socratic question if a preference is missing; otherwise propose concrete StateUpdate.days fixes with itemized costs, transport details, meal details, and start/end times.\n\n${issueLines}`;
+  return `Please validate the current trip feasibility against these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if a preference is missing; otherwise propose concrete StateUpdate.days fixes with itemized costs, transport details, meal details, and start/end times. Do not mark any day completed.\n\n${issueLines}`;
 };
 
 const formatDayCompletionReviewMessage = (dayNumber: number, issues: CoverageIssue[]) => {
+  if (!issues.length) {
+    return `Please validate Day ${dayNumber} for feasibility. Check whether a traveler could follow this day blind from start to finish, including transport, timing, meals, costs, and practical instructions. If it is already usable, confirm briefly and do not change completion state. If details are missing, ask one Socratic question or propose a StateUpdate.days patch only for Day ${dayNumber}.`;
+  }
+
   const issueLines = issues
     .slice(0, 8)
     .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
     .join("\n");
 
-  return `Please help me complete Day ${dayNumber}. The app blocked completion because these day-specific gaps remain. Ask one Socratic question if you still need a preference; otherwise propose a StateUpdate.days patch only for Day ${dayNumber} with actionable details, itemized costs, transport details, meal details, and start/end times.\n\n${issueLines}`;
+  return `Please validate Day ${dayNumber} for feasibility against these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if you still need a preference; otherwise propose a StateUpdate.days patch only for Day ${dayNumber} with actionable details, itemized costs, transport details, meal details, and start/end times. Do not mark the day completed.\n\n${issueLines}`;
 };
 
 const getBlockingDayCompletionIssues = (trip: TripState, dayNumber: number) =>
@@ -1499,7 +1537,7 @@ const coerceDays = (value: unknown): DayPlan[] | undefined => {
         hotel: coerceHotel(item.hotel),
         spend: asNumber(item.spend),
         warning: asBoolean(item.warning),
-        completed: asBoolean(item.completed),
+        completed: false,
         activities: coerceActivities(item.activities),
       };
     })
@@ -2248,11 +2286,11 @@ function ChatMessageRow({
     return (
       <div className="mb-4 flex items-end justify-end gap-2">
         {message.source === "ui_action" && <span className="pb-1 text-[10px] text-gray-400">via widget</span>}
-        <div className="flex max-w-[80%] flex-col items-end gap-1">
+        <div className="max-w-[80%]">
           <div className="rounded-2xl rounded-tr-none px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm" style={{ background: T }}>
             {message.text}
+            <div className="mt-1 text-right text-[10px] text-white/70">{formatMessageTime(message.timestamp)}</div>
           </div>
-          <span className="pr-1 text-[10px] text-gray-400">{formatMessageTime(message.timestamp)}</span>
         </div>
       </div>
     );
@@ -2366,7 +2404,6 @@ function MetricsGrid({
   onRequestReviewFix?: (issues: CoverageIssue[]) => void;
 }) {
   const metrics = metricCardsFromTrip(trip);
-  const [showReview, setShowReview] = useState(false);
   const coverageIssues = computeCoverageIssues(trip);
   const missingCount = coverageIssues.filter((issue) => issue.severity === "missing").length;
 
@@ -2382,12 +2419,12 @@ function MetricsGrid({
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setShowReview((value) => !value)}
+              onClick={() => onRequestReviewFix?.(coverageIssues)}
               className="flex items-center gap-1.5 rounded-lg border bg-white px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wide transition hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
               style={{ borderColor: missingCount ? AMBER_BORDER : T_BORDER, color: missingCount ? AMBER : T }}
             >
               <ClipboardCheck className="h-3.5 w-3.5" />
-              Review Plan {missingCount ? `(${missingCount})` : ""}
+              Validate Feasibility
             </button>
             {onExportTrip && (
             <button
@@ -2425,40 +2462,8 @@ function MetricsGrid({
                 {metric.sub}
               </div>
             </div>
-          ))}
+            ))}
         </div>
-        {showReview && (
-          <div className="mt-3 rounded-2xl border bg-white px-4 py-3" style={{ borderColor: coverageIssues.length ? AMBER_BORDER : GREEN_BORDER }}>
-            <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest" style={{ color: coverageIssues.length ? AMBER : GREEN }}>
-              <ClipboardCheck className="h-3.5 w-3.5" />
-              Plan completeness review
-            </div>
-            {coverageIssues.length === 0 ? (
-              <p className="text-xs font-semibold text-green-700">No local coverage gaps detected.</p>
-            ) : (
-              <div>
-                <div className="grid max-h-36 gap-1.5 overflow-y-auto pr-1">
-                  {coverageIssues.slice(0, 10).map((issue) => (
-                    <div key={issue.id} className="rounded-lg px-2 py-1.5 text-xs" style={{ background: issue.severity === "missing" ? AMBER_LIGHT : "#F8FAFC", color: "#334155" }}>
-                      <span className="font-semibold">{issue.label}</span>
-                      <span className="text-slate-500"> - {issue.detail}</span>
-                    </div>
-                  ))}
-                  {coverageIssues.length > 10 && <div className="text-xs font-semibold text-slate-400">+{coverageIssues.length - 10} more checks</div>}
-                </div>
-                {onRequestReviewFix && (
-                  <button
-                    onClick={() => onRequestReviewFix(coverageIssues)}
-                    className="mt-3 rounded-lg px-3 py-1.5 text-xs font-bold text-white transition hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-amber-200"
-                    style={{ background: AMBER }}
-                  >
-                    Ask VoyagerAI to resolve gaps
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-        )}
       </div>
     </div>
   );
@@ -2544,22 +2549,20 @@ function ItineraryArtifact({
   trip,
   focus,
   pendingEdit,
-  completionWarning,
   disabledActions,
   onSetFocus,
   onToggleDayComplete,
-  onRequestDayCompletionFix,
+  onValidateDay,
   onAcceptPendingDay,
   onRejectPendingDay,
 }: {
   trip: TripState;
   focus: FocusTarget | null;
   pendingEdit: PendingEdit | null;
-  completionWarning: CompletionWarning | null;
   disabledActions?: boolean;
   onSetFocus: (focus: FocusTarget) => void;
   onToggleDayComplete: (day: number) => void;
-  onRequestDayCompletionFix: (day: number, issues: CoverageIssue[]) => void;
+  onValidateDay: (day: number) => void;
   onAcceptPendingDay: PendingDayAction;
   onRejectPendingDay: PendingDayAction;
 }) {
@@ -2602,7 +2605,7 @@ function ItineraryArtifact({
           <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-gray-400">Itinerary</div>
           <h2 className="text-lg font-semibold text-slate-800">{trip.destination || "Current trip plan"}</h2>
         </div>
-        {trip.status && <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-gray-500 shadow-sm">{trip.status}</span>}
+        {trip.status && !isInternalPhaseStatus(trip.status) && <span className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-gray-500 shadow-sm">{trip.status}</span>}
       </div>
 
       {trip.days.map((day) => {
@@ -2613,8 +2616,6 @@ function ItineraryArtifact({
         const pendingDay = pendingEdit?.patch.days?.find((candidate) => candidate.day === day.day);
         const locationLabel = day.location || day.city || trip.destination;
         const hotelLabel = day.hotel?.name || (fallbackNightlyCost ? "Selected accommodation" : "");
-        const dayCompletionIssues = getBlockingDayCompletionIssues(trip, day.day);
-        const activeCompletionWarning = completionWarning?.day === day.day ? completionWarning : null;
         return (
           <div
             key={day.day}
@@ -2661,30 +2662,6 @@ function ItineraryArtifact({
                   />
                 )}
                 {day.summary && <p className="mb-3 rounded-xl bg-white px-3 py-2 text-xs leading-relaxed text-gray-500">{day.summary}</p>}
-                {activeCompletionWarning && (
-                  <div className="mb-3 rounded-2xl border px-4 py-3 text-xs" style={{ background: AMBER_LIGHT, borderColor: AMBER_BORDER, color: "#92400E" }}>
-                    <div className="mb-2 flex items-center gap-2 font-bold uppercase tracking-widest" style={{ color: AMBER }}>
-                      <AlertTriangle className="h-3.5 w-3.5" />
-                      Completion blocked
-                    </div>
-                    <div className="grid gap-1">
-                      {activeCompletionWarning.issues.slice(0, 5).map((issue) => (
-                        <div key={issue.id}>
-                          <span className="font-semibold">{issue.label}</span>
-                          <span className="text-slate-500"> - {issue.detail}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <button
-                      disabled={disabledActions}
-                      onClick={() => onRequestDayCompletionFix(day.day, activeCompletionWarning.issues)}
-                      className="mt-3 rounded-lg px-3 py-1.5 text-xs font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ background: AMBER }}
-                    >
-                      Ask VoyagerAI to complete Day {day.day}
-                    </button>
-                  </div>
-                )}
 
                 <div className="mb-3 space-y-2">
                   {day.hotel && (
@@ -2721,25 +2698,6 @@ function ItineraryArtifact({
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-medium" style={{ color: activity.changed ? GREEN : "#374151" }}>{activity.name}</div>
                         {activity.note && <div className="text-xs text-gray-400">{activity.note}</div>}
-                        {(!activity.endTime || typeof activity.cost !== "number" || hasSparseActionableDetail(activity)) && (
-                          <div className="mt-1 flex flex-wrap gap-1">
-                            {!activity.endTime && (
-                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
-                                Missing end time
-                              </span>
-                            )}
-                            {typeof activity.cost !== "number" && (
-                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
-                                Missing cost
-                              </span>
-                            )}
-                            {hasSparseActionableDetail(activity) && (
-                              <span className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
-                                Needs detail
-                              </span>
-                            )}
-                          </div>
-                        )}
                       </div>
                       {typeof activity.cost === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(activity.cost, trip.currency)}</span>}
                       <button
@@ -2763,6 +2721,18 @@ function ItineraryArtifact({
 
                 <div className="flex justify-end gap-2 border-t border-gray-100 pt-2.5">
                   <button
+                    disabled={disabledActions}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onValidateDay(day.day);
+                    }}
+                    className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors hover:bg-amber-50 focus:outline-none focus:ring-2 focus:ring-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
+                    style={{ border: `1.5px solid ${AMBER}`, color: AMBER, background: "white" }}
+                  >
+                    <ClipboardCheck className="h-3.5 w-3.5" />
+                    Validate day
+                  </button>
+                  <button
                     onClick={(event) => {
                       event.stopPropagation();
                       onToggleDayComplete(day.day);
@@ -2771,7 +2741,7 @@ function ItineraryArtifact({
                     style={day.completed ? { background: GREEN, color: "white" } : { border: `1.5px solid ${GREEN}`, color: GREEN, background: "white" }}
                   >
                     <Check className="h-3.5 w-3.5" />
-                    {day.completed ? "Completed" : dayCompletionIssues.length ? `Complete blocked (${dayCompletionIssues.length})` : "Mark day complete"}
+                    {day.completed ? "Completed" : "Mark day complete"}
                   </button>
                   <button
                     onClick={(event) => {
@@ -3303,7 +3273,6 @@ function ConditionBScreen({
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [pendingEdit, setPendingEdit] = useState<PendingEdit | null>(null);
-  const [completionWarning, setCompletionWarning] = useState<CompletionWarning | null>(null);
   const messagesRef = useRef<Message[]>([]);
   const stateRef = useRef(state);
   const eventsRef = useRef<SessionEvent[]>([]);
@@ -3345,20 +3314,20 @@ function ConditionBScreen({
     });
   };
 
-  const handleSend = async (text: string, source: "typed" | "ui_action" = "typed") => {
+  const handleSend = async (text: string, source: "typed" | "ui_action" = "typed", visibleText = text) => {
     const userMsg: Message = {
       id: makeId(),
-      text,
+      text: visibleText,
       rawText: text,
       sender: "user",
       source,
       timestamp: getTimestamp(),
-      wordCount: countWords(text),
+      wordCount: countWords(visibleText),
     };
     const newHistory = [...messagesRef.current, userMsg];
     messagesRef.current = newHistory;
     setMessages(newHistory);
-    appendEvent(eventsRef, { type: "chat_user", role: "user", messageId: userMsg.id, source, wordCount: userMsg.wordCount, content: text });
+    appendEvent(eventsRef, { type: "chat_user", role: "user", messageId: userMsg.id, source, wordCount: userMsg.wordCount, content: visibleText, metadata: visibleText === text ? undefined : { rawText: text } });
 
     setIsLoading(true);
     const aiMsgId = makeId();
@@ -3631,26 +3600,6 @@ function ConditionBScreen({
   };
 
   const toggleDayComplete = (dayNumber: number) => {
-    const currentDay = stateRef.current.trip.days.find((day) => day.day === dayNumber);
-    const blockingIssues = getBlockingDayCompletionIssues(stateRef.current.trip, dayNumber);
-    if (currentDay && !currentDay.completed && blockingIssues.length) {
-      setCompletionWarning({ day: dayNumber, issues: blockingIssues });
-      appendEvent(eventsRef, {
-        type: "ui_action",
-        role: "user",
-        source: "itinerary_complete_blocked",
-        content: `Completion blocked for Day ${dayNumber}`,
-        metadata: { day: dayNumber, issues: blockingIssues },
-      });
-      postClientLog({
-        type: "day_completion_blocked",
-        day: dayNumber,
-        issues: blockingIssues,
-      });
-      return;
-    }
-
-    setCompletionWarning((current) => (current?.day === dayNumber ? null : current));
     let nextCompleted = false;
     updateState((previous) => {
       const days = previous.trip.days.map((day) => {
@@ -3674,6 +3623,11 @@ function ConditionBScreen({
       content: `Day ${dayNumber} completion updated`,
       metadata: { day: dayNumber, completed: nextCompleted },
     });
+  };
+
+  const validateDay = (dayNumber: number) => {
+    const issues = getBlockingDayCompletionIssues(stateRef.current.trip, dayNumber);
+    handleRequestDayCompletionFix(dayNumber, issues);
   };
 
   const cancelFocus = () => {
@@ -3722,7 +3676,7 @@ function ConditionBScreen({
       content: "Ask VoyagerAI to resolve local completeness gaps",
       metadata: { issues },
     });
-    void handleSend(message, "ui_action");
+    void handleSend(message, "ui_action", "Check feasibility");
   };
 
   const handleRequestDayCompletionFix = (dayNumber: number, issues: CoverageIssue[]) => {
@@ -3738,7 +3692,7 @@ function ConditionBScreen({
       content: `Ask VoyagerAI to complete Day ${dayNumber}`,
       metadata: { day: dayNumber, issues, focus },
     });
-    void handleSend(message, "ui_action");
+    void handleSend(message, "ui_action", "Check feasibility");
   };
 
   const lastMessageId = messages[messages.length - 1]?.id;
@@ -3780,11 +3734,10 @@ function ConditionBScreen({
             trip={state.trip}
             focus={state.focus}
             pendingEdit={pendingEdit}
-            completionWarning={completionWarning}
             disabledActions={isLoading}
             onSetFocus={setEditFocus}
             onToggleDayComplete={toggleDayComplete}
-            onRequestDayCompletionFix={handleRequestDayCompletionFix}
+            onValidateDay={validateDay}
             onAcceptPendingDay={acceptPendingDay}
             onRejectPendingDay={rejectPendingDay}
           />
