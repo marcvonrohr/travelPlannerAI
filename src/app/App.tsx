@@ -62,6 +62,8 @@ const PREFS_BG = "#DDE5F0";
 // --- Types -------------------------------------------------------------------
 type Condition = "A" | "B";
 
+type InterventionCategory = "widget_shown" | "widget_clicked" | "validation" | "accept_reject" | "focus_mode";
+
 type UserPreference = {
   label: string;
   value?: string;
@@ -133,6 +135,7 @@ export type Message = {
   sender: "user" | "ai";
   source?: "typed" | "ui_action";
   timestamp: string;
+  turnIndex?: number;
   wordCount: number;
 };
 
@@ -152,6 +155,13 @@ type SessionEvent = {
   role?: "user" | "ai" | "system";
   messageId?: string;
   source?: string;
+  turnIndex?: number;
+  participantId?: string;
+  researcher?: string;
+  condition?: Condition;
+  interventionCategory?: InterventionCategory;
+  widgetType?: string;
+  actionSource?: string;
   wordCount?: number;
   content?: string;
   metadata?: Record<string, unknown>;
@@ -167,6 +177,7 @@ type PendingEdit = {
   messageId: string;
   patch: TripPatch;
   focus: FocusTarget;
+  turnIndex?: number;
   userText?: string;
 };
 
@@ -1156,6 +1167,37 @@ const isInternalPhaseStatus = (status?: string) => Boolean(status && /^phase[_\s
 const normalizeTextKey = (value: string) => value.trim().toLowerCase();
 
 const RESEARCH_CONSOLE_KEY = "voyagerlab:research-console";
+const VISIBLE_OPENUI_WIDGETS = ["HotelOptions", "QuickPreferences", "ConflictWarning", "SuggestionChips", "PreferenceOptions"];
+const eventLogContexts = new WeakMap<SessionEvent[], Pick<S, "participantId" | "researcher" | "condition">>();
+
+const setSessionEventContext = (eventsRef: React.MutableRefObject<SessionEvent[]>, state: S) => {
+  eventLogContexts.set(eventsRef.current, {
+    participantId: state.participantId,
+    researcher: state.researcher,
+    condition: state.condition,
+  });
+};
+
+const getOpenUIWidgetTypes = (openUI?: string) => {
+  if (!openUI) return [];
+  return VISIBLE_OPENUI_WIDGETS.filter((name) => new RegExp(`\\b${name}\\s*\\(`).test(openUI));
+};
+
+const getLatestWidgetType = (messages: Message[]) => {
+  const latestOpenUI = [...messages].reverse().find((message) => message.openUI)?.openUI;
+  return getOpenUIWidgetTypes(latestOpenUI).join(", ") || undefined;
+};
+
+const postSessionEventLog = (event: SessionEvent) => {
+  if (typeof window === "undefined" || !window.location.protocol.startsWith("http")) return;
+  fetch("/api/session-event-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(event),
+  }).catch(() => {
+    // Persistent research logging must never affect the experiment UI.
+  });
+};
 
 const appendResearchConsoleEntry = (type: string, summary: string, payload?: unknown) => {
   if (typeof window === "undefined") return;
@@ -1177,13 +1219,19 @@ const appendResearchConsoleEntry = (type: string, summary: string, payload?: unk
 };
 
 const appendEvent = (eventsRef: React.MutableRefObject<SessionEvent[]>, event: Omit<SessionEvent, "id" | "timestamp"> & { timestamp?: string }) => {
+  const context = eventLogContexts.get(eventsRef.current);
   const savedEvent = {
     id: makeId(),
     timestamp: event.timestamp ?? getTimestamp(),
+    participantId: event.participantId ?? context?.participantId,
+    researcher: event.researcher ?? context?.researcher,
+    condition: event.condition ?? context?.condition,
+    actionSource: event.actionSource ?? event.source,
     ...event,
   };
   eventsRef.current.push(savedEvent);
   appendResearchConsoleEntry(savedEvent.type, savedEvent.content || savedEvent.source || savedEvent.role || "session event", savedEvent);
+  postSessionEventLog(savedEvent);
 };
 
 const escapeCSV = (value: unknown) => {
@@ -1191,13 +1239,56 @@ const escapeCSV = (value: unknown) => {
   return `"${str.replace(/"/g, '""')}"`;
 };
 
-const generateCSVAndDownload = (
+type CSVArtifact = {
+  filename: string;
+  csvContent: string;
+  artifactType: "session_log" | "trip_plan";
+};
+
+const downloadCSVArtifact = (artifact: CSVArtifact) => {
+  const blob = new Blob([artifact.csvContent], { type: "text/csv;charset=utf-8;" });
+  const link = document.createElement("a");
+  link.setAttribute("href", URL.createObjectURL(blob));
+  link.setAttribute("download", artifact.filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
+const persistResearchArtifact = async (artifact: CSVArtifact) => {
+  if (typeof window === "undefined" || !window.location.protocol.startsWith("http")) return;
+
+  try {
+    const response = await fetch("/api/research-artifact", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        artifactType: artifact.artifactType,
+        filename: artifact.filename,
+        contentType: "text/csv;charset=utf-8",
+        content: artifact.csvContent,
+      }),
+    });
+
+    if (!response.ok) throw new Error(await response.text().catch(() => `HTTP ${response.status}`));
+  } catch (error) {
+    console.error("[VoyagerLab] Research artifact persistence failed", error);
+    postClientLog({
+      type: "research_artifact_persist_failed",
+      artifactType: artifact.artifactType,
+      filename: artifact.filename,
+      error: serializeError(error),
+    });
+  }
+};
+
+const buildSessionCSVArtifact = (
   state: S,
   sessionStartStr: string,
   durationSec: number,
   messages: Message[],
   events: SessionEvent[],
-) => {
+): CSVArtifact => {
   const userMessages = messages.filter((m) => m.sender === "user");
   const totalUserTurns = userMessages.length;
   const averageUserWordCount =
@@ -1205,28 +1296,44 @@ const generateCSVAndDownload = (
       ? 0
       : Math.round((userMessages.reduce((sum, m) => sum + m.wordCount, 0) / totalUserTurns) * 100) / 100;
   const uiInterventions = events.filter((event) => event.type === "ui_action").length;
+  const interventionCount = (category: InterventionCategory) =>
+    events.filter((event) => event.interventionCategory === category).length;
+  const widgetShown = interventionCount("widget_shown");
+  const widgetClicked = interventionCount("widget_clicked");
+  const validationEvents = interventionCount("validation");
+  const acceptRejectEvents = interventionCount("accept_reject");
+  const focusModeEvents = interventionCount("focus_mode");
   const finalTripState = JSON.stringify(state.trip);
   const finalComputedMetrics = JSON.stringify(computeTripMetrics(state.trip));
 
   let csvContent =
-    "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,AverageUserWordCount,UIInterventions,EventID,EventType,Role,Timestamp,MessageID,Source,WordCount,Content,Metadata,FinalTripState,FinalComputedMetrics\n";
+    "ParticipantID,Researcher,Condition,SessionStart,SessionDurationSec,TotalUserTurns,AverageUserWordCount,UIInterventions,WidgetShown,WidgetClicked,ValidationEvents,AcceptRejectEvents,FocusModeEvents,EventID,EventType,Role,Timestamp,TurnIndex,MessageID,Source,InterventionCategory,WidgetType,ActionSource,WordCount,Content,Metadata,FinalTripState,FinalComputedMetrics\n";
 
   events.forEach((event) => {
     const row = [
-      state.participantId,
-      state.researcher,
-      state.condition,
+      event.participantId ?? state.participantId,
+      event.researcher ?? state.researcher,
+      event.condition ?? state.condition,
       sessionStartStr,
       durationSec,
       totalUserTurns,
       averageUserWordCount,
       uiInterventions,
+      widgetShown,
+      widgetClicked,
+      validationEvents,
+      acceptRejectEvents,
+      focusModeEvents,
       event.id,
       event.type,
       event.role ?? "",
       event.timestamp,
+      event.turnIndex ?? "",
       event.messageId ?? "",
       event.source ?? "",
+      event.interventionCategory ?? "",
+      event.widgetType ?? "",
+      event.actionSource ?? "",
       event.wordCount ?? "",
       event.content ?? "",
       event.metadata ?? {},
@@ -1236,19 +1343,14 @@ const generateCSVAndDownload = (
     csvContent += `${row.join(",")}\n`;
   });
 
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const link = document.createElement("a");
-  link.setAttribute("href", URL.createObjectURL(blob));
-  link.setAttribute(
-    "download",
-    `VoyagerLab_Log_${state.participantId || "unknown"}_Cond${state.condition}_${Date.now()}.csv`,
-  );
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+  return {
+    artifactType: "session_log",
+    filename: `VoyagerLab_Log_${state.participantId || "unknown"}_Cond${state.condition}_${Date.now()}.csv`,
+    csvContent,
+  };
 };
 
-const generateTripCSVAndDownload = (state: S) => {
+const buildTripCSVArtifact = (state: S): CSVArtifact => {
   const metrics = computeTripMetrics(state.trip);
   const fallbackNightlyCost = extractNightlyCostFromPreferences(state.trip.preferences);
   let csvContent =
@@ -1297,13 +1399,17 @@ const generateTripCSVAndDownload = (state: S) => {
     }
   }
 
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const link = document.createElement("a");
-  link.setAttribute("href", URL.createObjectURL(blob));
-  link.setAttribute("download", `VoyagerLab_Trip_${state.participantId || "unknown"}_${Date.now()}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+  return {
+    artifactType: "trip_plan",
+    filename: `VoyagerLab_Trip_${state.participantId || "unknown"}_${Date.now()}.csv`,
+    csvContent,
+  };
+};
+
+const generateTripCSVAndDownload = (state: S) => {
+  const artifact = buildTripCSVArtifact(state);
+  void persistResearchArtifact(artifact);
+  downloadCSVArtifact(artifact);
 };
 
 const splitAssistantResponse = (rawText: string) => {
@@ -1433,9 +1539,30 @@ const metricCardsFromTrip = (trip: TripState) => {
   ];
 };
 
-const formatCoverageReviewMessage = (issues: CoverageIssue[]) => {
+const formatActivePreferencesForValidation = (trip: TripState) => {
+  const basics = [
+    trip.destination ? `Destination/region: ${trip.destination}` : "",
+    typeof trip.budget === "number" ? `Budget ceiling: ${trip.budget} ${trip.currency || "CHF"}` : "",
+    trip.durationDays ? `Duration: ${trip.durationDays} days` : "",
+    trip.travelers ? `Travelers: ${trip.travelers}` : "",
+  ].filter(Boolean);
+  const preferences = trip.preferences.map((pref, index) => {
+    const value = pref.value ? ` = ${pref.value}` : "";
+    const category = pref.category ? ` [${pref.category}]` : "";
+    const status = pref.status ? ` (${pref.status})` : "";
+    return `${index + 1}. ${pref.label}${value}${category}${status}`;
+  });
+
+  return `ACTIVE PREFERENCES AND CONSTRAINTS TO AUDIT:
+${[...basics, ...preferences.map((pref) => `Preference: ${pref}`)].map((item) => `- ${item}`).join("\n") || "- None captured yet."}`;
+};
+
+const formatCoverageReviewMessage = (trip: TripState, issues: CoverageIssue[]) => {
+  const preferenceAudit = formatActivePreferencesForValidation(trip);
   if (!issues.length) {
-    return "Please validate the current trip feasibility. Check whether a traveler could follow the plan from start to finish without hidden assumptions. If anything material is missing, ask one Socratic question or propose a concrete StateUpdate patch. Do not mark any day completed.";
+    return `Please validate the current trip feasibility. Check whether a traveler could follow the plan from start to finish without hidden assumptions. Audit the plan against the active preferences and constraints below. If anything material is missing, ask one Socratic question or propose a concrete StateUpdate patch. Do not mark any day completed.
+
+${preferenceAudit}`;
   }
 
   const issueLines = issues
@@ -1443,12 +1570,20 @@ const formatCoverageReviewMessage = (issues: CoverageIssue[]) => {
     .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
     .join("\n");
 
-  return `Please validate the current trip feasibility against these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if a preference is missing; otherwise propose concrete StateUpdate.days fixes with itemized costs, transport details, meal details, and start/end times. Do not mark any day completed.\n\n${issueLines}`;
+  return `Please validate the current trip feasibility against the active preferences/constraints and these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if a preference is missing; otherwise propose concrete StateUpdate.days fixes with itemized costs, transport details, meal details, and start/end times. Do not mark any day completed.
+
+${preferenceAudit}
+
+LOCAL COMPLETENESS GAPS:
+${issueLines}`;
 };
 
-const formatDayCompletionReviewMessage = (dayNumber: number, issues: CoverageIssue[]) => {
+const formatDayCompletionReviewMessage = (trip: TripState, dayNumber: number, issues: CoverageIssue[]) => {
+  const preferenceAudit = formatActivePreferencesForValidation(trip);
   if (!issues.length) {
-    return `Please validate Day ${dayNumber} for feasibility. Check whether a traveler could follow this day blind from start to finish, including transport, timing, meals, costs, and practical instructions. If it is already usable, confirm briefly and do not change completion state. If details are missing, ask one Socratic question or propose a StateUpdate.days patch only for Day ${dayNumber}.`;
+    return `Please validate Day ${dayNumber} for feasibility. Check whether a traveler could follow this day blind from start to finish, including transport, timing, meals, costs, practical instructions, and all active preferences/constraints below. If it is already usable, confirm briefly and do not change completion state. If details are missing, ask one Socratic question or propose a StateUpdate.days patch only for Day ${dayNumber}.
+
+${preferenceAudit}`;
   }
 
   const issueLines = issues
@@ -1456,7 +1591,12 @@ const formatDayCompletionReviewMessage = (dayNumber: number, issues: CoverageIss
     .map((issue, index) => `${index + 1}. ${issue.label}: ${issue.detail}`)
     .join("\n");
 
-  return `Please validate Day ${dayNumber} for feasibility against these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if you still need a preference; otherwise propose a StateUpdate.days patch only for Day ${dayNumber} with actionable details, itemized costs, transport details, meal details, and start/end times. Do not mark the day completed.\n\n${issueLines}`;
+  return `Please validate Day ${dayNumber} for feasibility against the active preferences/constraints and these hidden local gaps. Do not expose this checklist verbatim. Ask one Socratic question if you still need a preference; otherwise propose a StateUpdate.days patch only for Day ${dayNumber} with actionable details, itemized costs, transport details, meal details, and start/end times. Do not mark the day completed.
+
+${preferenceAudit}
+
+LOCAL COMPLETENESS GAPS:
+${issueLines}`;
 };
 
 const getBlockingDayCompletionIssues = (trip: TripState, dayNumber: number) =>
@@ -1970,6 +2110,7 @@ const callGeminiAPIStream = async (
   state: S,
   onChunk: (chunk: string) => void,
   eventsRef?: React.MutableRefObject<SessionEvent[]>,
+  turnIndex?: number,
 ) => {
   const useDevProxy = typeof window !== "undefined" && window.location.protocol.startsWith("http");
 
@@ -2010,6 +2151,7 @@ const callGeminiAPIStream = async (
   appendResearchConsoleEntry("api_request", `Condition ${condition} request ${requestId}`, {
     requestId,
     condition,
+    turnIndex,
     model: GEMINI_MODEL,
     systemPrompt: fullSystemPrompt || null,
     contents,
@@ -2018,6 +2160,7 @@ const callGeminiAPIStream = async (
   appendEventIfAvailable(eventsRef, {
     type: "api_request",
     role: "system",
+    turnIndex,
     content: "VoyagerAI request",
     metadata: { requestId, condition, model: GEMINI_MODEL, systemPrompt: fullSystemPrompt || null, contents },
   });
@@ -2078,6 +2221,7 @@ const callGeminiAPIStream = async (
       appendResearchConsoleEntry("api_response", `Condition ${condition} response ${requestId}`, {
         requestId,
         condition,
+        turnIndex,
         model: GEMINI_MODEL,
         rawResponse,
       });
@@ -2085,6 +2229,7 @@ const callGeminiAPIStream = async (
       appendEventIfAvailable(eventsRef, {
         type: "api_response",
         role: "ai",
+        turnIndex,
         content: rawResponse,
         metadata: { requestId, condition, model: GEMINI_MODEL },
       });
@@ -2104,17 +2249,20 @@ const callGeminiAPIStream = async (
       appendResearchConsoleEntry("api_error", `Condition ${condition} request failed ${requestId}`, {
         requestId,
         condition,
+        turnIndex,
         error: serializeError(error),
       });
       postClientLog({
         type: "voyagerai_request_failed",
         requestId,
         condition,
+        turnIndex,
         error: serializeError(error),
       });
       appendEventIfAvailable(eventsRef, {
         type: "api_error",
         role: "system",
+        turnIndex,
         content: message,
         metadata: { requestId, condition },
       });
@@ -3152,8 +3300,13 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
   const [isLoading, setIsLoading] = useState(false);
   const messagesRef = useRef<Message[]>([]);
   const eventsRef = useRef<SessionEvent[]>([]);
+  const turnIndexRef = useRef(0);
   const startRef = useRef({ time: Date.now(), str: new Date().toISOString() });
   const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setSessionEventContext(eventsRef, state);
+  }, [state]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -3168,6 +3321,8 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
   }, [messages]);
 
   const handleSend = async (text: string) => {
+    const turnIndex = turnIndexRef.current + 1;
+    turnIndexRef.current = turnIndex;
     const userMsg: Message = {
       id: makeId(),
       text,
@@ -3175,16 +3330,17 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
       sender: "user",
       source: "typed",
       timestamp: getTimestamp(),
+      turnIndex,
       wordCount: countWords(text),
     };
     const newHistory = [...messagesRef.current, userMsg];
     messagesRef.current = newHistory;
     setMessages(newHistory);
-    appendEvent(eventsRef, { type: "chat_user", role: "user", messageId: userMsg.id, source: "typed", wordCount: userMsg.wordCount, content: text });
+    appendEvent(eventsRef, { type: "chat_user", role: "user", turnIndex, messageId: userMsg.id, source: "typed", wordCount: userMsg.wordCount, content: text });
 
     setIsLoading(true);
     const aiMsgId = makeId();
-    const aiPlaceholder: Message = { id: aiMsgId, text: "", rawText: "", sender: "ai", timestamp: getTimestamp(), wordCount: 0 };
+    const aiPlaceholder: Message = { id: aiMsgId, text: "", rawText: "", sender: "ai", timestamp: getTimestamp(), turnIndex, wordCount: 0 };
     messagesRef.current = [...newHistory, aiPlaceholder];
     setMessages(messagesRef.current);
 
@@ -3199,11 +3355,12 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
           messagesRef.current = updated;
           return updated;
         });
-      }, eventsRef);
+      }, eventsRef, turnIndex);
 
       appendEvent(eventsRef, {
         type: "chat_ai",
         role: "ai",
+        turnIndex,
         messageId: aiMsgId,
         content: rawResponse,
         wordCount: countWords(rawResponse),
@@ -3212,7 +3369,7 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
       const message = error instanceof Error ? error.message : "Unknown chat error";
       console.error("[VoyagerLab] Condition A send failed", error);
       postClientLog({ type: "condition_a_send_failed", error: serializeError(error) });
-      appendEvent(eventsRef, { type: "api_error", role: "system", messageId: aiMsgId, content: message });
+      appendEvent(eventsRef, { type: "api_error", role: "system", turnIndex, messageId: aiMsgId, content: message });
       setMessages((previous) => {
         const updated = previous.map((item) =>
           item.id === aiMsgId
@@ -3227,7 +3384,7 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
     }
   };
 
-  const handleEndSession = () => {
+  const handleEndSession = async () => {
     const durationSec = Math.round((Date.now() - startRef.current.time) / 1000);
     appendEvent(eventsRef, {
       type: "session_end",
@@ -3235,7 +3392,7 @@ function ConditionAScreen({ state, onEndSession }: { state: S; onEndSession: () 
       content: "Condition A session ended",
       metadata: { durationSec },
     });
-    generateCSVAndDownload(state, startRef.current.str, durationSec, messagesRef.current, eventsRef.current);
+    await persistResearchArtifact(buildSessionCSVArtifact(state, startRef.current.str, durationSec, messagesRef.current, eventsRef.current));
     onEndSession();
   };
 
@@ -3276,12 +3433,14 @@ function ConditionBScreen({
   const messagesRef = useRef<Message[]>([]);
   const stateRef = useRef(state);
   const eventsRef = useRef<SessionEvent[]>([]);
+  const turnIndexRef = useRef(0);
   const startRef = useRef({ time: Date.now(), str: new Date().toISOString() });
   const endRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     stateRef.current = state;
+    setSessionEventContext(eventsRef, state);
   }, [state]);
 
   useEffect(() => {
@@ -3300,7 +3459,7 @@ function ConditionBScreen({
     });
   }, [messages, state.focus]);
 
-  const applyOpenUITripPatch = (patch: TripPatch, messageId: string, focusOverride?: FocusTarget | null, userText = "") => {
+  const applyOpenUITripPatch = (patch: TripPatch, messageId: string, focusOverride?: FocusTarget | null, userText = "", turnIndex?: number) => {
     updateState((previous) => ({
       ...previous,
       trip: applyTripPatch(previous.trip, patch, focusOverride === undefined ? previous.focus : focusOverride, userText),
@@ -3308,13 +3467,16 @@ function ConditionBScreen({
     appendEvent(eventsRef, {
       type: "state_update",
       role: "system",
+      turnIndex,
       messageId,
       content: "OpenUI StateUpdate applied",
       metadata: patch,
     });
   };
 
-  const handleSend = async (text: string, source: "typed" | "ui_action" = "typed", visibleText = text) => {
+  const handleSend = async (text: string, source: "typed" | "ui_action" = "typed", visibleText = text, options?: { turnIndex?: number }) => {
+    const turnIndex = options?.turnIndex ?? turnIndexRef.current + 1;
+    turnIndexRef.current = Math.max(turnIndexRef.current, turnIndex);
     const userMsg: Message = {
       id: makeId(),
       text: visibleText,
@@ -3322,16 +3484,17 @@ function ConditionBScreen({
       sender: "user",
       source,
       timestamp: getTimestamp(),
+      turnIndex,
       wordCount: countWords(visibleText),
     };
     const newHistory = [...messagesRef.current, userMsg];
     messagesRef.current = newHistory;
     setMessages(newHistory);
-    appendEvent(eventsRef, { type: "chat_user", role: "user", messageId: userMsg.id, source, wordCount: userMsg.wordCount, content: visibleText, metadata: visibleText === text ? undefined : { rawText: text } });
+    appendEvent(eventsRef, { type: "chat_user", role: "user", turnIndex, messageId: userMsg.id, source, wordCount: userMsg.wordCount, content: visibleText, metadata: visibleText === text ? undefined : { rawText: text } });
 
     setIsLoading(true);
     const aiMsgId = makeId();
-    const aiPlaceholder: Message = { id: aiMsgId, text: "", rawText: "", sender: "ai", timestamp: getTimestamp(), wordCount: 0 };
+    const aiPlaceholder: Message = { id: aiMsgId, text: "", rawText: "", sender: "ai", timestamp: getTimestamp(), turnIndex, wordCount: 0 };
     messagesRef.current = [...newHistory, aiPlaceholder];
     setMessages(messagesRef.current);
 
@@ -3352,7 +3515,7 @@ function ConditionBScreen({
           messagesRef.current = updated;
           return updated;
         });
-      }, eventsRef);
+      }, eventsRef, turnIndex);
 
       const finalParsed = splitAssistantResponse(rawResponse);
       const finalOpenUI = finalParsed.openUI;
@@ -3374,6 +3537,7 @@ function ConditionBScreen({
           appendEvent(eventsRef, {
             type: "api_error",
             role: "system",
+            turnIndex,
             messageId: aiMsgId,
             content: "OpenUI parse errors after final Gemini response",
             metadata: { errors, openUI: finalOpenUI },
@@ -3391,12 +3555,27 @@ function ConditionBScreen({
             appendEvent(eventsRef, {
               type: "state_update",
               role: "system",
+              turnIndex,
               messageId: aiMsgId,
               content: suppressionReason,
               metadata: { openUI: finalOpenUI },
             });
           } else {
             renderableOpenUI = finalOpenUI;
+            getOpenUIWidgetTypes(finalOpenUI).forEach((widgetType) => {
+              appendEvent(eventsRef, {
+                type: "ui_action",
+                role: "system",
+                turnIndex,
+                source: "openui_render",
+                actionSource: "openui_render",
+                interventionCategory: "widget_shown",
+                widgetType,
+                messageId: aiMsgId,
+                content: `${widgetType} shown`,
+                metadata: { openUI: finalOpenUI },
+              });
+            });
           }
           patchToApply = patch;
         }
@@ -3411,6 +3590,7 @@ function ConditionBScreen({
         appendEvent(eventsRef, {
           type: "api_error",
           role: "system",
+          turnIndex,
           messageId: aiMsgId,
           content: "Incomplete OpenUI block skipped",
           metadata: { openUI: finalParsed.malformedOpenUI },
@@ -3439,10 +3619,11 @@ function ConditionBScreen({
         if (activeFocus && patchToApply.days?.length) {
           const pendingPatch = preparePendingFocusPatch(stateRef.current.trip, patchToApply, activeFocus, text);
           if (pendingPatch?.days?.length) {
-            setPendingEdit({ id: makeId(), messageId: aiMsgId, patch: pendingPatch, focus: activeFocus, userText: text });
+            setPendingEdit({ id: makeId(), messageId: aiMsgId, patch: pendingPatch, focus: activeFocus, turnIndex, userText: text });
             appendEvent(eventsRef, {
               type: "state_update",
               role: "system",
+              turnIndex,
               messageId: aiMsgId,
               content: "Focused itinerary patch held for review",
               metadata: { patch: pendingPatch, focus: activeFocus },
@@ -3456,9 +3637,10 @@ function ConditionBScreen({
           } else {
             const nonItineraryPatch: TripPatch = { ...patchToApply, days: undefined };
             if (Object.keys(nonItineraryPatch).some((key) => key !== "days" && nonItineraryPatch[key as keyof TripPatch] !== undefined)) {
-              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text);
+              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text, turnIndex);
               postClientLog({
                 type: "state_patch_applied_without_itinerary_changes",
+                turnIndex,
                 messageId: aiMsgId,
                 patch: nonItineraryPatch,
                 focus: activeFocus,
@@ -3473,11 +3655,13 @@ function ConditionBScreen({
               messageId: aiMsgId,
               patch: { ...patchToApply, days: pendingPatch.days },
               focus: { type: "trip", label: "Reviewing itinerary changes" },
+              turnIndex,
               userText: text,
             });
             appendEvent(eventsRef, {
               type: "state_update",
               role: "system",
+              turnIndex,
               messageId: aiMsgId,
               content: "Itinerary patch held for review",
               metadata: { patch: { ...patchToApply, days: pendingPatch.days } },
@@ -3491,18 +3675,20 @@ function ConditionBScreen({
           } else {
             const nonItineraryPatch: TripPatch = { ...patchToApply, days: undefined };
             if (Object.keys(nonItineraryPatch).some((key) => key !== "days" && nonItineraryPatch[key as keyof TripPatch] !== undefined)) {
-              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text);
+              applyOpenUITripPatch(nonItineraryPatch, aiMsgId, null, text, turnIndex);
               postClientLog({
                 type: "state_patch_applied_without_itinerary_changes",
+                turnIndex,
                 messageId: aiMsgId,
                 patch: nonItineraryPatch,
               });
             }
           }
         } else {
-          applyOpenUITripPatch(patchToApply, aiMsgId, undefined, text);
+          applyOpenUITripPatch(patchToApply, aiMsgId, undefined, text, turnIndex);
           postClientLog({
             type: "state_patch_applied",
+            turnIndex,
             messageId: aiMsgId,
             patch: patchToApply,
           });
@@ -3512,6 +3698,7 @@ function ConditionBScreen({
       appendEvent(eventsRef, {
         type: "chat_ai",
         role: "ai",
+        turnIndex,
         messageId: aiMsgId,
         content: rawResponse,
         wordCount: countWords(rawResponse),
@@ -3521,7 +3708,7 @@ function ConditionBScreen({
       const message = error instanceof Error ? error.message : "Unknown chat error";
       console.error("[VoyagerLab] Condition B send failed", error);
       postClientLog({ type: "condition_b_send_failed", error: serializeError(error) });
-      appendEvent(eventsRef, { type: "api_error", role: "system", messageId: aiMsgId, content: message });
+      appendEvent(eventsRef, { type: "api_error", role: "system", turnIndex, messageId: aiMsgId, content: message });
       setMessages((previous) => {
         const updated = previous.map((item) =>
           item.id === aiMsgId
@@ -3537,6 +3724,8 @@ function ConditionBScreen({
   };
 
   const handleOpenUIAction = (event: ActionEvent) => {
+    const turnIndex = turnIndexRef.current + 1;
+    const widgetType = getLatestWidgetType(messagesRef.current);
     const message =
       event.humanFriendlyMessage ||
       (event.type === BuiltinActionType.ContinueConversation && typeof event.params?.message === "string" ? event.params.message : "Continue");
@@ -3544,7 +3733,11 @@ function ConditionBScreen({
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex,
       source: "openui",
+      actionSource: "openui",
+      interventionCategory: "widget_clicked",
+      widgetType,
       content: message,
       metadata: {
         actionType: event.type,
@@ -3554,7 +3747,7 @@ function ConditionBScreen({
       },
     });
 
-    void handleSend(message, "ui_action");
+    void handleSend(message, "ui_action", message, { turnIndex });
   };
 
   const setEditFocus = (focus: FocusTarget) => {
@@ -3563,7 +3756,10 @@ function ConditionBScreen({
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex: turnIndexRef.current || undefined,
       source: "itinerary_focus",
+      actionSource: "itinerary_focus",
+      interventionCategory: "focus_mode",
       content: `Focus ${focus.label}`,
       metadata: focus,
     });
@@ -3575,11 +3771,14 @@ function ConditionBScreen({
     if (!day) return;
     const isLastPendingDay = (pendingEdit.patch.days?.length ?? 0) === 1;
     const patch = markPatchDaysDraft(isLastPendingDay ? { ...pendingEdit.patch, days: [day] } : { days: [day] });
-    applyOpenUITripPatch(patch, pendingEdit.messageId, null, pendingEdit.userText ?? "");
+    applyOpenUITripPatch(patch, pendingEdit.messageId, null, pendingEdit.userText ?? "", pendingEdit.turnIndex);
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex: pendingEdit.turnIndex ?? (turnIndexRef.current || undefined),
       source: "pending_edit",
+      actionSource: "pending_edit",
+      interventionCategory: "accept_reject",
       content: `Accept focused itinerary changes for Day ${dayNumber}`,
       metadata: { pendingId: pendingEdit.id, focus: pendingEdit.focus, day: dayNumber, patch },
     });
@@ -3592,7 +3791,10 @@ function ConditionBScreen({
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex: pendingEdit.turnIndex ?? (turnIndexRef.current || undefined),
       source: "pending_edit",
+      actionSource: "pending_edit",
+      interventionCategory: "accept_reject",
       content: `Reject focused itinerary changes for Day ${dayNumber}`,
       metadata: { pendingId: pendingEdit.id, focus: pendingEdit.focus, day: dayNumber, patch: day },
     });
@@ -3637,13 +3839,16 @@ function ConditionBScreen({
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex: turnIndexRef.current || undefined,
       source: "focus_cancel",
+      actionSource: "focus_cancel",
+      interventionCategory: "focus_mode",
       content: "Cancel focus mode",
       metadata: { previousFocus },
     });
   };
 
-  const handleEndSession = () => {
+  const handleEndSession = async () => {
     const durationSec = Math.round((Date.now() - startRef.current.time) / 1000);
     appendEvent(eventsRef, {
       type: "session_end",
@@ -3651,7 +3856,10 @@ function ConditionBScreen({
       content: "Condition B session ended",
       metadata: { durationSec, trip: stateRef.current.trip },
     });
-    generateCSVAndDownload(stateRef.current, startRef.current.str, durationSec, messagesRef.current, eventsRef.current);
+    await Promise.all([
+      persistResearchArtifact(buildSessionCSVArtifact(stateRef.current, startRef.current.str, durationSec, messagesRef.current, eventsRef.current)),
+      persistResearchArtifact(buildTripCSVArtifact(stateRef.current)),
+    ]);
     onEndSession();
   };
 
@@ -3668,31 +3876,39 @@ function ConditionBScreen({
 
   const handleRequestReviewFix = (issues: CoverageIssue[]) => {
     if (isLoading) return;
-    const message = formatCoverageReviewMessage(issues);
+    const turnIndex = turnIndexRef.current + 1;
+    const message = formatCoverageReviewMessage(stateRef.current.trip, issues);
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex,
       source: "plan_review",
+      actionSource: "plan_review",
+      interventionCategory: "validation",
       content: "Ask VoyagerAI to resolve local completeness gaps",
       metadata: { issues },
     });
-    void handleSend(message, "ui_action", "Check feasibility");
+    void handleSend(message, "ui_action", "Check feasibility", { turnIndex });
   };
 
   const handleRequestDayCompletionFix = (dayNumber: number, issues: CoverageIssue[]) => {
     if (isLoading) return;
-    const message = formatDayCompletionReviewMessage(dayNumber, issues);
+    const turnIndex = turnIndexRef.current + 1;
+    const message = formatDayCompletionReviewMessage(stateRef.current.trip, dayNumber, issues);
     const focus: FocusTarget = { type: "day", day: dayNumber, label: `Editing Day ${dayNumber}` };
     setPendingEdit(null);
     updateState({ focus });
     appendEvent(eventsRef, {
       type: "ui_action",
       role: "user",
+      turnIndex,
       source: "day_completion_review",
+      actionSource: "day_completion_review",
+      interventionCategory: "validation",
       content: `Ask VoyagerAI to complete Day ${dayNumber}`,
       metadata: { day: dayNumber, issues, focus },
     });
-    void handleSend(message, "ui_action", "Check feasibility");
+    void handleSend(message, "ui_action", "Check feasibility", { turnIndex });
   };
 
   const lastMessageId = messages[messages.length - 1]?.id;

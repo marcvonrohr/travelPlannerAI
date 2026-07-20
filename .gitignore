@@ -49,6 +49,8 @@ typings
 
 # Logs
 *storybook.log
+logs/
+outputs/
 
 # scripts and tools
 clean-install.sh

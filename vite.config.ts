@@ -1,4 +1,5 @@
 import { defineConfig, loadEnv } from 'vite'
+import fs from 'fs'
 import path from 'path'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
@@ -18,10 +19,71 @@ function figmaAssetResolver() {
 function geminiDevProxy(mode) {
   const env = loadEnv(mode, process.cwd(), '')
   const apiKey = env.GEMINI_API_KEY || env.VITE_GEMINI_API_KEY || ''
+  const logDirectory = path.resolve(process.cwd(), 'logs')
+  const outputDirectory = path.resolve(process.cwd(), 'outputs')
 
   return {
     name: 'gemini-dev-proxy',
     configureServer(server) {
+      server.middlewares.use('/api/research-artifact', async (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+
+        try {
+          const body = await readRequestBody(req)
+          const payload = JSON.parse(body || '{}')
+          const receivedAt = new Date().toISOString()
+          const outputDate = receivedAt.slice(0, 10)
+          const artifactType = sanitizePathSegment(payload.artifactType || 'artifact')
+          const filename = sanitizeFilename(payload.filename || `VoyagerLab_${artifactType}_${Date.now()}.csv`)
+          const content = typeof payload.content === 'string' ? payload.content : ''
+          const directory = path.join(outputDirectory, outputDate)
+          const filePath = path.join(directory, filename)
+
+          fs.mkdirSync(directory, { recursive: true })
+          fs.writeFileSync(filePath, content, 'utf8')
+          console.log(`[VoyagerLab][Artifact] ${artifactType} -> ${path.relative(process.cwd(), filePath)}`)
+
+          res.statusCode = 204
+          res.end()
+        } catch (error) {
+          console.error('[VoyagerLab][Artifact] Failed to write research artifact', error)
+          res.statusCode = 500
+          res.end(error instanceof Error ? error.message : 'Research artifact write failed')
+        }
+      })
+
+      server.middlewares.use('/api/session-event-log', async (req, res) => {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end('Method not allowed')
+          return
+        }
+
+        try {
+          const body = await readRequestBody(req)
+          const payload = JSON.parse(body || '{}')
+          const receivedAt = new Date().toISOString()
+          const logDate = receivedAt.slice(0, 10)
+          const filePath = path.join(logDirectory, `voyagerlab-session-${logDate}.jsonl`)
+          const entry = { receivedAt, ...payload }
+
+          fs.mkdirSync(logDirectory, { recursive: true })
+          fs.appendFileSync(filePath, `${JSON.stringify(entry)}\n`, 'utf8')
+          console.log(`[VoyagerLab][SessionLog] ${entry.type || 'event'} ${entry.id || ''} -> ${path.relative(process.cwd(), filePath)}`)
+
+          res.statusCode = 204
+          res.end()
+        } catch (error) {
+          console.error('[VoyagerLab][SessionLog] Failed to write event log', error)
+          res.statusCode = 500
+          res.end(error instanceof Error ? error.message : 'Session event log failed')
+        }
+      })
+
       server.middlewares.use('/api/client-log', async (req, res) => {
         if (req.method !== 'POST') {
           res.statusCode = 405
@@ -124,6 +186,19 @@ function geminiDevProxy(mode) {
       })
     },
   }
+}
+
+function sanitizePathSegment(value) {
+  return String(value)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .slice(0, 80) || 'artifact'
+}
+
+function sanitizeFilename(value) {
+  const filename = path.basename(String(value)).replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '')
+  const safeName = filename || 'artifact'
+  return safeName.toLowerCase().endsWith('.csv') ? safeName : `${safeName}.csv`
 }
 
 function readRequestBody(req) {
