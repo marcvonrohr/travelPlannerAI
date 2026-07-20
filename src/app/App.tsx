@@ -63,6 +63,16 @@ const PREFS_BG = "#DDE5F0";
 type Condition = "A" | "B";
 
 type InterventionCategory = "widget_shown" | "widget_clicked" | "validation" | "accept_reject" | "focus_mode";
+type ActivityType = "meal" | "transport" | "activity" | "rest" | "lodging" | "flight" | "other";
+type CostBasis = "per_person" | "per_group" | "per_night" | "per_day" | "one_time";
+
+type CostDetails = {
+  amount: number;
+  currency?: string;
+  basis?: CostBasis;
+  includedInBudget?: boolean;
+  category?: string;
+};
 
 type UserPreference = {
   label: string;
@@ -74,9 +84,11 @@ type UserPreference = {
 type Activity = {
   time: string;
   endTime?: string;
+  type?: ActivityType;
   name: string;
   note?: string;
   cost?: number;
+  costDetails?: CostDetails;
   constraintMatch?: string;
   changed?: boolean;
 };
@@ -86,6 +98,7 @@ type HotelStay = {
   tier?: string;
   city?: string;
   pricePerNight?: number;
+  costDetails?: CostDetails;
 };
 
 type DayPlan = {
@@ -239,12 +252,22 @@ const PreferenceSchema = z.object({
   status: z.enum(["captured", "satisfied", "conflict"]).optional(),
 });
 
+const CostDetailsSchema = z.object({
+  amount: z.number(),
+  currency: z.string().optional(),
+  basis: z.enum(["per_person", "per_group", "per_night", "per_day", "one_time"]).optional(),
+  includedInBudget: z.boolean().optional(),
+  category: z.string().optional(),
+});
+
 const ActivitySchema = z.object({
   time: z.string(),
   endTime: z.string().optional(),
+  type: z.enum(["meal", "transport", "activity", "rest", "lodging", "flight", "other"]).optional(),
   name: z.string(),
   note: z.string().optional(),
   cost: z.number().optional(),
+  costDetails: CostDetailsSchema.optional(),
   constraintMatch: z.string().optional(),
   changed: z.boolean().optional(),
 });
@@ -254,6 +277,7 @@ const HotelStaySchema = z.object({
   tier: z.string().optional(),
   city: z.string().optional(),
   pricePerNight: z.number().optional(),
+  costDetails: CostDetailsSchema.optional(),
 });
 
 const DayPlanSchema = z.object({
@@ -706,7 +730,10 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Never set completed true in StateUpdate.days. Completion is controlled only by the local Complete day button.",
     "When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.",
     "Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.",
-    "Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.",
+    "Use itemized costDetails as the cost source of truth. Keep legacy activity cost and hotel pricePerNight populated for compatibility. Use day.spend only as a rough fallback when no itemized costs are available.",
+    "For every activity, include type as one of meal, transport, activity, rest, lodging, flight, or other.",
+    "For every priced activity, include costDetails with amount, currency, basis, includedInBudget, and category. If basis is unclear, use per_person.",
+    "For hotels and lodging, include costDetails with basis per_night. A trip with N days has N-1 hotel nights.",
     "Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.",
     "Before planning meals, ask the user Socratic questions about meal rhythm, dietary restrictions, cuisine priorities, and how detailed the food plan should be.",
     "Do not ask the same dietary or meal-preference widget twice. If a dietary requirement is already captured, ask the next missing food-planning question such as meal rhythm, cuisine style, budget per meal, or restaurant detail level.",
@@ -716,6 +743,7 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Final itinerary entries must be actionable: transport needs from/to, mode, duration, and schedule guidance; meals need meal type, place/area, and dietary fit; activities need what to do, why it fits, duration, and cost.",
     "Avoid bare labels such as \"Transfer\", \"Dinner\", \"Old Town\", or \"Hiking\" in StateUpdate.days. Add implementation detail in note and use endTime.",
     "Every activity must include a numeric cost. Use 0 for free sights, realistic average prices for meals, and estimated fares for transport.",
+    "Use legacy cost and pricePerNight for compatibility, but costDetails is the authoritative structured cost field.",
     "Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.",
     "When the user removes a preference, return StateUpdate with the full remaining active preferences list. When the user removes all preferences, return StateUpdate with preferences as an empty array.",
     "Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.",
@@ -724,8 +752,9 @@ const OPENUI_PROMPT = travelOpenUILibrary.prompt({
     "Always append one fenced ```openui-lang code block when the Socratic condition needs to update dashboard state or show widgets.",
     "The fenced OpenUI code must start with root = TravelUI([...]).",
     "Always include StateUpdate in Socratic responses once any travel data is known.",
-    "Use numeric CHF values without currency symbols in budget, spend, cost, and pricePerNight fields; currency goes in the currency field.",
+    "Use numeric CHF values without currency symbols in budget, spend, cost, pricePerNight, and costDetails.amount fields; currency goes in currency or costDetails.currency.",
     "Valid HotelOptions example: options = HotelOptions(\"Choose a concrete stay\", [{tier: \"Mid-range\", name: \"Hotel Astoria\", city: \"Kotor\", pricePerNight: 95, summary: \"Central old-town stay.\", fit: \"Walkable and within budget\"}])",
+    "Valid StateUpdate activity example: {time: \"09:00\", endTime: \"10:30\", type: \"transport\", name: \"Bus to trailhead\", note: \"Take bus 12 from the central station; check current times locally.\", cost: 5, costDetails: {amount: 5, currency: \"CHF\", basis: \"per_person\", includedInBudget: true, category: \"transport\"}}",
     "Do not use named arguments or colon syntax in component calls; component arguments are positional.",
     "Use HotelOptions when accommodation tier or hotel choice is useful.",
     "Use ConflictWarning when budget, time, preference, or feasibility constraints collide.",
@@ -782,7 +811,10 @@ Behavior rules:
 - Never set completed true in StateUpdate.days. Completion is controlled only by the local Complete day button.
 - When lodging is selected, write the selected hotel or accommodation into every applicable day.hotel with pricePerNight so cost metrics include lodging.
 - Each planned day should consider activities, transport, meals or food constraints, and rest time where relevant.
-- Use itemized activity costs and hotel pricePerNight as the cost source of truth. Use day.spend only as a rough fallback when no itemized costs are available.
+- Use itemized costDetails as the cost source of truth. Keep legacy activity cost and hotel pricePerNight populated for compatibility. Use day.spend only as a rough fallback when no itemized costs are available.
+- For every activity, include type as one of meal, transport, activity, rest, lodging, flight, or other.
+- For every priced activity, include costDetails with amount, currency, basis, includedInBudget, and category. If basis is unclear, use per_person.
+- For hotels and lodging, include costDetails with basis per_night. A trip with N days has N-1 hotel nights.
 - Before adding concrete activities, first ask what kinds of experiences, pace, and interests the user enjoys unless those preferences are already clear.
 - Before planning meals, ask Socratic questions about meal rhythm, dietary restrictions, cuisine priorities, and how detailed the food plan should be.
 - Do not ask the same dietary or meal-preference widget twice. If a dietary requirement is already captured, ask the next missing food-planning question such as meal rhythm, cuisine style, budget per meal, or restaurant detail level.
@@ -792,6 +824,7 @@ Behavior rules:
 - Final itinerary entries must be actionable: transport needs from/to, mode, duration, and schedule guidance; meals need meal type, place/area, and dietary fit; activities need what to do, why it fits, duration, and cost.
 - Avoid bare labels such as "Transfer", "Dinner", "Old Town", or "Hiking" in StateUpdate.days. Add implementation detail in note and use endTime.
 - Every activity must include a numeric cost. Use 0 for free sights, realistic average prices for meals, and estimated fares for transport.
+- Use legacy cost and pricePerNight for compatibility, but costDetails is the authoritative structured cost field.
 - Ask whether inbound arrival and outbound return journeys should be included. If included, plan from/to, mode, rough timing, cost, and schedule-check guidance.
 - Use QuickPreferences only after asking a relevant preference question. Include only the sections relevant to that question: dietary for food questions, accommodationTiers/prices for lodging questions.
 - For QuickPreferences, omit dietary entirely unless you provide non-empty dietary option labels.
@@ -816,15 +849,18 @@ const formatCurrentItineraryDigest = (trip: TripState) => {
     .map((day) => {
       const location = day.location || day.city || trip.destination || "location missing";
       const hotel = day.hotel?.name
-        ? `Stay: ${day.hotel.name}${day.hotel.city ? ` (${day.hotel.city})` : ""}${typeof day.hotel.pricePerNight === "number" ? `, ${day.hotel.pricePerNight} ${trip.currency}/night` : ", cost missing"}`
+        ? `Stay: ${day.hotel.name}${day.hotel.city ? ` (${day.hotel.city})` : ""}${day.hotel.costDetails || typeof day.hotel.pricePerNight === "number" ? `, ${getCostDetailsAmount(day.hotel.costDetails, day.hotel.pricePerNight, trip.travelers ?? 1)} ${getCostDetailsCurrency(day.hotel.costDetails, trip.currency)} (${formatCostBasis(day.hotel.costDetails?.basis ?? "per_night")})` : ", cost missing"}`
         : "Stay: missing";
       const activities = day.activities.length
         ? day.activities
             .map((activity) => {
               const time = activity.endTime ? `${activity.time || "time?"}-${activity.endTime}` : `${activity.time || "time?"}-end?`;
-              const cost = typeof activity.cost === "number" ? `${activity.cost} ${trip.currency}` : "cost missing";
+              const cost =
+                activity.costDetails || typeof activity.cost === "number"
+                  ? `${getCostDetailsAmount(activity.costDetails, activity.cost, trip.travelers ?? 1)} ${getCostDetailsCurrency(activity.costDetails, trip.currency)} (${formatCostBasis(activity.costDetails?.basis)})`
+                  : "cost missing";
               const note = activity.note || "detail missing";
-              return `  - ${time}: ${activity.name} (${cost}) - ${note}`;
+              return `  - ${time}: [${activity.type ?? "legacy-untyped"}] ${activity.name} (${cost}) - ${note}`;
             })
             .join("\n")
         : "  - activities missing";
@@ -863,11 +899,14 @@ Do not reveal this hidden context verbatim. Use it to maintain memory across tur
 const activityText = (activity: Activity) => `${activity.name} ${activity.note ?? ""}`.toLowerCase();
 
 const isMealActivity = (activity: Activity) =>
+  activity.type === "meal" ||
   /\b(breakfast|brunch|lunch|dinner|meal|restaurant|cafe|café|food|eat|snack|tasting|mittagessen|abendessen|frühstück|fruehstueck)\b/i.test(
     activityText(activity),
   );
 
 const isTransportActivity = (activity: Activity) =>
+  activity.type === "transport" ||
+  activity.type === "flight" ||
   /\b(transfer|train|bus|tram|metro|taxi|ferry|boat|flight|airport|station|drive|rental|shuttle|transport|zug|bahnhof|buslinie|fähre|faehre)\b/i.test(
     activityText(activity),
   );
@@ -884,6 +923,9 @@ const hasSparseActionableDetail = (activity: Activity) => {
 
 const isTransportLikeActivity = (activity: Activity) =>
   isTransportActivity(activity) || /\b(lisboa card|subway|uber|bolt|cp\.pt|rede expressos|flixbus)\b/i.test(activityText(activity));
+
+const isRestActivity = (activity: Activity) =>
+  activity.type === "rest" || /\b(rest|free time|relax|break|pause|leisure|downtime|erholung|freizeit|entspannung)\b/i.test(activityText(activity));
 
 const getMealTargetFromPreferences = (preferences: UserPreference[]) => {
   const text = preferences.map((pref) => `${pref.label} ${pref.value ?? ""}`).join(" ").toLowerCase();
@@ -981,7 +1023,7 @@ const computeCoverageIssues = (trip: TripState): CoverageIssue[] => {
     if (!day.hotel?.name) {
       issues.push({ id: `day-${day.day}-hotel`, severity: "missing", day: day.day, label: `Day ${day.day}: lodging missing`, detail: "Add a concrete hotel/lodging name and nightly price." });
     }
-    if (day.hotel && typeof day.hotel.pricePerNight !== "number") {
+    if (day.hotel && !day.hotel.costDetails && typeof day.hotel.pricePerNight !== "number") {
       issues.push({ id: `day-${day.day}-hotel-cost`, severity: "missing", day: day.day, label: `Day ${day.day}: lodging cost missing`, detail: "Hotel/lodging needs a numeric pricePerNight." });
     }
 
@@ -1000,9 +1042,16 @@ const computeCoverageIssues = (trip: TripState): CoverageIssue[] => {
       issues.push({ id: `day-${day.day}-transport`, severity: "missing", day: day.day, label: `Day ${day.day}: transport missing`, detail: "Add local or intercity transport with route, mode, duration, and cost." });
     }
 
+    if (day.activities.length >= 4 && !day.activities.some(isRestActivity)) {
+      issues.push({ id: `day-${day.day}-rest`, severity: "warning", day: day.day, label: `Day ${day.day}: rest time not explicit`, detail: "Consider adding a rest/free-time block so the schedule remains realistic." });
+    }
+
     day.activities.forEach((activity, index) => {
-      if (typeof activity.cost !== "number") {
-        issues.push({ id: `day-${day.day}-activity-${index}-cost`, severity: "missing", day: day.day, label: `Day ${day.day}: cost missing`, detail: `${activity.name} needs a numeric cost. Use 0 for free sights.` });
+      if (!activity.type) {
+        issues.push({ id: `day-${day.day}-activity-${index}-type`, severity: "warning", day: day.day, label: `Day ${day.day}: activity type missing`, detail: `${activity.name} should include type meal, transport, activity, rest, lodging, flight, or other.` });
+      }
+      if (!activity.costDetails && typeof activity.cost !== "number") {
+        issues.push({ id: `day-${day.day}-activity-${index}-cost`, severity: "missing", day: day.day, label: `Day ${day.day}: cost missing`, detail: `${activity.name} needs costDetails.amount or a legacy numeric cost. Use 0 for free sights.` });
       }
       if (!activity.endTime) {
         issues.push({ id: `day-${day.day}-activity-${index}-end`, severity: "missing", day: day.day, label: `Day ${day.day}: end time missing`, detail: `${activity.name} needs an approximate endTime.` });
@@ -1354,7 +1403,7 @@ const buildTripCSVArtifact = (state: S): CSVArtifact => {
   const metrics = computeTripMetrics(state.trip);
   const fallbackNightlyCost = extractNightlyCostFromPreferences(state.trip.preferences);
   let csvContent =
-    "ParticipantID,Researcher,Condition,ExportedAt,MetricTotalCost,MetricSatisfiedPrefs,MetricCapturedPrefs,MetricConflicts,MetricCompletedDays,MetricDraftedDays,PreferenceLabel,PreferenceValue,PreferenceCategory,PreferenceStatus,Day,Completed,Title,Location,HotelName,HotelTier,HotelCost,DayCost,Warning,ActivityStart,ActivityEnd,ActivityName,ActivityCost,ActivityNote,FinalTripState\n";
+    "ParticipantID,Researcher,Condition,ExportedAt,MetricTotalCost,MetricSatisfiedPrefs,MetricCapturedPrefs,MetricConflicts,MetricCompletedDays,MetricDraftedDays,PreferenceLabel,PreferenceValue,PreferenceCategory,PreferenceStatus,Day,Completed,Title,Location,HotelName,HotelTier,HotelCost,HotelCostAmount,HotelCostCurrency,HotelCostBasis,HotelIncludedInBudget,HotelCostCategory,DayCost,Warning,ActivityStart,ActivityEnd,ActivityType,ActivityName,ActivityCost,ActivityCostAmount,ActivityCostCurrency,ActivityCostBasis,ActivityIncludedInBudget,ActivityCostCategory,ActivityNote,FinalTripState\n";
 
   const preferences = state.trip.preferences.length ? state.trip.preferences : [{ label: "", value: "", category: "", status: "" } as UserPreference];
   const days = state.trip.days.length ? state.trip.days : [{ day: 0, title: "", activities: [] } as DayPlan];
@@ -1363,6 +1412,10 @@ const buildTripCSVArtifact = (state: S): CSVArtifact => {
     for (const day of days) {
       const activities = day.activities.length ? day.activities : [{ time: "", name: "" } as Activity];
       for (const activity of activities) {
+        const hotelCost = getDayHotelCost(day, state.trip);
+        const hotelCostDetails = day.hotel?.costDetails;
+        const activityCost = getCostDetailsAmount(activity.costDetails, activity.cost, state.trip.travelers ?? 1);
+        const activityCostDetails = activity.costDetails;
         const row = [
           state.participantId,
           state.researcher,
@@ -1384,13 +1437,24 @@ const buildTripCSVArtifact = (state: S): CSVArtifact => {
           day.location || day.city || "",
           day.hotel?.name ?? "",
           day.hotel?.tier ?? "",
-          getDayHotelCost(day, fallbackNightlyCost),
-          computeDayCost(day, fallbackNightlyCost),
+          hotelCost,
+          hotelCostDetails?.amount ?? day.hotel?.pricePerNight ?? fallbackNightlyCost ?? "",
+          getCostDetailsCurrency(hotelCostDetails, state.trip.currency),
+          getCostDetailsBasis(hotelCostDetails),
+          hotelCostDetails?.includedInBudget === false ? "no" : "yes",
+          hotelCostDetails?.category ?? "lodging",
+          computeDayCost(day, state.trip),
           day.warning ? "yes" : "no",
           activity.time,
           activity.endTime ?? "",
+          activity.type ?? "",
           activity.name,
-          activity.cost ?? "",
+          activityCost,
+          activityCostDetails?.amount ?? activity.cost ?? "",
+          getCostDetailsCurrency(activityCostDetails, state.trip.currency),
+          getCostDetailsBasis(activityCostDetails),
+          activityCostDetails?.includedInBudget === false ? "no" : "yes",
+          activityCostDetails?.category ?? activity.type ?? "",
           activity.note ?? "",
           state.trip,
         ].map(escapeCSV);
@@ -1454,9 +1518,54 @@ const splitAssistantResponse = (rawText: string) => {
 
 const getMessageTextForModel = (message: Message) => message.rawText || message.text;
 
-const getDayHotelCost = (day: DayPlan, fallbackNightlyCost?: number) => {
-  if (typeof day.hotel?.pricePerNight === "number" && !Number.isNaN(day.hotel.pricePerNight)) return day.hotel.pricePerNight;
-  return fallbackNightlyCost ?? 0;
+const getCostDetailsAmount = (costDetails?: CostDetails, legacyAmount?: number, travelers = 1) => {
+  if (costDetails?.includedInBudget === false) return 0;
+  if (costDetails) {
+    const basis = costDetails.basis ?? "per_person";
+    if (basis === "per_group") return costDetails.amount / Math.max(travelers, 1);
+    return costDetails.amount;
+  }
+  return typeof legacyAmount === "number" && !Number.isNaN(legacyAmount) ? legacyAmount : 0;
+};
+
+const getCostDetailsCurrency = (costDetails?: CostDetails, fallback = "CHF") => costDetails?.currency || fallback;
+
+const getCostDetailsBasis = (costDetails?: CostDetails) => costDetails?.basis ?? "per_person";
+
+const formatCostBasis = (basis?: CostBasis) => {
+  switch (basis ?? "per_person") {
+    case "per_group":
+      return "group";
+    case "per_night":
+      return "night";
+    case "per_day":
+      return "day";
+    case "one_time":
+      return "once";
+    case "per_person":
+    default:
+      return "person";
+  }
+};
+
+const formatActivityType = (type?: ActivityType) => {
+  if (!type) return "Activity";
+  return type.charAt(0).toUpperCase() + type.slice(1);
+};
+
+const shouldChargeLodgingForDay = (day: DayPlan, trip?: TripState) => {
+  if (!trip) return true;
+  if (trip.days.length <= 1) return false;
+  const maxChargeableDay = trip.durationDays ? Math.max(trip.durationDays - 1, 0) : Math.max(...trip.days.map((candidate) => candidate.day)) - 1;
+  return day.day <= maxChargeableDay;
+};
+
+const getDayHotelCost = (day: DayPlan, tripOrFallback?: TripState | number) => {
+  const trip = typeof tripOrFallback === "object" ? tripOrFallback : undefined;
+  const fallbackNightlyCost = typeof tripOrFallback === "number" ? tripOrFallback : trip ? extractNightlyCostFromPreferences(trip.preferences) : undefined;
+  const travelers = trip?.travelers ?? 1;
+  if (!shouldChargeLodgingForDay(day, trip)) return 0;
+  return getCostDetailsAmount(day.hotel?.costDetails, day.hotel?.pricePerNight ?? fallbackNightlyCost, travelers);
 };
 
 const extractNightlyCostFromPreferences = (preferences: UserPreference[]) => {
@@ -1465,18 +1574,21 @@ const extractNightlyCostFromPreferences = (preferences: UserPreference[]) => {
   return match ? Number(match[1].replace(",", ".")) : undefined;
 };
 
-const computeDayCost = (day: DayPlan, fallbackNightlyCost?: number) => {
-  const hotelCost = getDayHotelCost(day, fallbackNightlyCost);
-  const activitiesCost = day.activities.reduce((sum, activity) => sum + (activity.cost ?? 0), 0);
+const computeDayCost = (day: DayPlan, tripOrFallback?: TripState | number) => {
+  const trip = typeof tripOrFallback === "object" ? tripOrFallback : undefined;
+  const hotelCost = getDayHotelCost(day, tripOrFallback);
+  const travelers = trip?.travelers ?? 1;
+  const activitiesCost = day.activities.reduce((sum, activity) => sum + getCostDetailsAmount(activity.costDetails, activity.cost, travelers), 0);
   const explicitSpend = typeof day.spend === "number" && !Number.isNaN(day.spend) ? day.spend : undefined;
-  const hasItemizedCosts = hotelCost > 0 || day.activities.some((activity) => typeof activity.cost === "number" && !Number.isNaN(activity.cost));
+  const hasItemizedCosts =
+    hotelCost > 0 ||
+    day.activities.some((activity) => activity.costDetails || (typeof activity.cost === "number" && !Number.isNaN(activity.cost)));
   if (hasItemizedCosts) return activitiesCost + hotelCost;
   return explicitSpend ?? 0;
 };
 
 function computeTripMetrics(trip: TripState) {
-  const fallbackNightlyCost = extractNightlyCostFromPreferences(trip.preferences);
-  const totalCost = trip.days.reduce((sum, day) => sum + computeDayCost(day, fallbackNightlyCost), 0);
+  const totalCost = trip.days.reduce((sum, day) => sum + computeDayCost(day, trip), 0);
   const capturedPrefs = trip.preferences.length;
   const satisfiedPrefs = trip.preferences.filter((pref) => pref.status !== "conflict").length;
   const conflicts = trip.preferences.filter((pref) => pref.status === "conflict").length + trip.days.filter((day) => day.warning).length;
@@ -1608,6 +1720,49 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const asString = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
 const asNumber = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
 const asBoolean = (value: unknown) => (typeof value === "boolean" ? value : undefined);
+const ACTIVITY_TYPES: ActivityType[] = ["meal", "transport", "activity", "rest", "lodging", "flight", "other"];
+const COST_BASES: CostBasis[] = ["per_person", "per_group", "per_night", "per_day", "one_time"];
+
+const asActivityType = (value: unknown): ActivityType | undefined => {
+  const candidate = asString(value);
+  return candidate && ACTIVITY_TYPES.includes(candidate as ActivityType) ? (candidate as ActivityType) : undefined;
+};
+
+const asCostBasis = (value: unknown): CostBasis | undefined => {
+  const candidate = asString(value);
+  return candidate && COST_BASES.includes(candidate as CostBasis) ? (candidate as CostBasis) : undefined;
+};
+
+const coerceCostDetails = (
+  value: unknown,
+  legacyAmount?: number,
+  fallbackCategory?: string,
+  defaultBasis: CostBasis = "per_person"
+): CostDetails | undefined => {
+  if (isRecord(value)) {
+    const amount = asNumber(value.amount);
+    if (typeof amount === "number") {
+      return {
+        amount,
+        currency: asString(value.currency),
+        basis: asCostBasis(value.basis) ?? defaultBasis,
+        includedInBudget: asBoolean(value.includedInBudget),
+        category: asString(value.category) ?? fallbackCategory,
+      };
+    }
+  }
+
+  if (typeof legacyAmount === "number") {
+    return {
+      amount: legacyAmount,
+      basis: defaultBasis,
+      includedInBudget: true,
+      category: fallbackCategory,
+    };
+  }
+
+  return undefined;
+};
 
 const coercePreferences = (value: unknown): UserPreference[] | undefined => {
   if (!Array.isArray(value)) return undefined;
@@ -1637,9 +1792,11 @@ const coerceActivities = (value: unknown): Activity[] => {
       return {
         time,
         endTime: asString(item.endTime),
+        type: asActivityType(item.type),
         name,
         note: asString(item.note),
         cost: asNumber(item.cost),
+        costDetails: coerceCostDetails(item.costDetails, asNumber(item.cost), asActivityType(item.type) ?? "activity"),
         constraintMatch: asString(item.constraintMatch),
         changed: asBoolean(item.changed),
       };
@@ -1657,6 +1814,7 @@ const coerceHotel = (value: unknown): HotelStay | null | undefined => {
     tier: asString(value.tier),
     city: asString(value.city),
     pricePerNight: asNumber(value.pricePerNight),
+    costDetails: coerceCostDetails(value.costDetails, asNumber(value.pricePerNight), "lodging", "per_night"),
   };
 };
 
@@ -2631,7 +2789,8 @@ function PendingValueChange({ label, oldValue, newValue }: { label: string; oldV
 const formatActivityForPreview = (activity: Activity | undefined) => {
   if (!activity) return "";
   const time = activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : activity.time || "--:--";
-  return [time, activity.name, activity.note, typeof activity.cost === "number" ? formatMoney(activity.cost) : ""].filter(Boolean).join(" | ");
+  const cost = activity.costDetails || typeof activity.cost === "number" ? formatMoney(getCostDetailsAmount(activity.costDetails, activity.cost), getCostDetailsCurrency(activity.costDetails)) : "";
+  return [time, formatActivityType(activity.type), activity.name, activity.note, cost].filter(Boolean).join(" | ");
 };
 
 function PendingDayPreview({
@@ -2677,8 +2836,16 @@ function PendingDayPreview({
         <PendingValueChange label="Hotel" oldValue={currentDay.hotel?.name} newValue={pendingDay.hotel?.name} />
         <PendingValueChange
           label="Hotel cost"
-          oldValue={typeof currentDay.hotel?.pricePerNight === "number" ? formatMoney(currentDay.hotel.pricePerNight) : undefined}
-          newValue={typeof pendingDay.hotel?.pricePerNight === "number" ? formatMoney(pendingDay.hotel.pricePerNight) : undefined}
+          oldValue={
+            currentDay.hotel?.costDetails || typeof currentDay.hotel?.pricePerNight === "number"
+              ? formatMoney(getCostDetailsAmount(currentDay.hotel?.costDetails, currentDay.hotel?.pricePerNight), getCostDetailsCurrency(currentDay.hotel?.costDetails))
+              : undefined
+          }
+          newValue={
+            pendingDay.hotel?.costDetails || typeof pendingDay.hotel?.pricePerNight === "number"
+              ? formatMoney(getCostDetailsAmount(pendingDay.hotel?.costDetails, pendingDay.hotel?.pricePerNight), getCostDetailsCurrency(pendingDay.hotel?.costDetails))
+              : undefined
+          }
         />
         {Array.from({ length: activityCount }, (_, index) => (
           <PendingValueChange
@@ -2759,7 +2926,7 @@ function ItineraryArtifact({
       {trip.days.map((day) => {
         const isOpen = expanded === day.day;
         const fallbackNightlyCost = extractNightlyCostFromPreferences(trip.preferences);
-        const dayCost = computeDayCost(day, fallbackNightlyCost);
+        const dayCost = computeDayCost(day, trip);
         const isDayFocused = focus?.type !== "trip" && focus?.day === day.day;
         const pendingDay = pendingEdit?.patch.days?.find((candidate) => candidate.day === day.day);
         const locationLabel = day.location || day.city || trip.destination;
@@ -2820,10 +2987,14 @@ function ItineraryArtifact({
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-medium text-slate-700">{day.hotel.name}</div>
-                        <div className="text-xs text-gray-400">{[day.hotel.tier, day.hotel.city].filter(Boolean).join(" - ")}</div>
+                        <div className="text-xs text-gray-400">
+                          {[day.hotel.tier, day.hotel.city, `cost basis: ${formatCostBasis(day.hotel.costDetails?.basis ?? "per_night")}`].filter(Boolean).join(" - ")}
+                        </div>
                       </div>
-                      {typeof day.hotel.pricePerNight === "number" ? (
-                        <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(day.hotel.pricePerNight, trip.currency)}</span>
+                      {getCostDetailsAmount(day.hotel.costDetails, day.hotel.pricePerNight, trip.travelers ?? 1) > 0 ? (
+                        <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>
+                          {formatMoney(getCostDetailsAmount(day.hotel.costDetails, day.hotel.pricePerNight, trip.travelers ?? 1), getCostDetailsCurrency(day.hotel.costDetails, trip.currency))}
+                        </span>
                       ) : (
                         <span className="flex-shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide" style={{ background: AMBER_LIGHT, color: AMBER }}>
                           Missing cost
@@ -2844,10 +3015,19 @@ function ItineraryArtifact({
                         {activity.endTime ? `${activity.time || "--:--"}-${activity.endTime}` : `${activity.time || "--:--"}-?`}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="text-sm font-medium" style={{ color: activity.changed ? GREEN : "#374151" }}>{activity.name}</div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-slate-400">
+                            {formatActivityType(activity.type)}
+                          </span>
+                          <div className="text-sm font-medium" style={{ color: activity.changed ? GREEN : "#374151" }}>{activity.name}</div>
+                        </div>
                         {activity.note && <div className="text-xs text-gray-400">{activity.note}</div>}
                       </div>
-                      {typeof activity.cost === "number" && <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>{formatMoney(activity.cost, trip.currency)}</span>}
+                      {(activity.costDetails || typeof activity.cost === "number") && (
+                        <span className="flex-shrink-0 text-xs font-semibold" style={{ color: T }}>
+                          {formatMoney(getCostDetailsAmount(activity.costDetails, activity.cost, trip.travelers ?? 1), getCostDetailsCurrency(activity.costDetails, trip.currency))}
+                        </span>
+                      )}
                       <button
                         onClick={() =>
                           onSetFocus({
